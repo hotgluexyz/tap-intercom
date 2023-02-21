@@ -242,7 +242,7 @@ class IncrementalStream(BaseStream):
 
                 # Sync child stream, if the child is selected and if we have records greater than the child stream bookmark
                 if has_child and is_child_selected and (record[self.replication_key] >= child_bookmark_ts):
-                    state = child_stream_obj.sync_substream(record.get('id'), child_schema, child_metadata, record[self.replication_key], state)
+                    state = child_stream_obj.sync_substream(record.get('id'), child_schema, child_metadata, child_bookmark_ts, state)
 
             bookmark_date = singer.utils.strftime(max_datetime)
             LOGGER.info("FINISHED Syncing: {}, total_records: {}.".format(self.tap_stream_id, counter.value))
@@ -582,11 +582,8 @@ class ConversationParts(BaseStream):
         response = self.client.get(call_path, params=self.params)
 
         data_for_transform = {self.data_key: [response]}
-        try:
-            state_value = parse(state["bookmarks"]["conversation_parts"]["updated_at"])
-        except:
-            parent = datetime.datetime.utcfromtimestamp(parent_replication_key/1000)
-            state_value = parent or datetime.datetime(2010, 1, 1)
+        parent = datetime.datetime.utcfromtimestamp(parent_replication_key/1000)
+        state_value = parent or datetime.datetime(2010, 1, 1)
 
         state_value = state_value.replace(tzinfo=pytz.UTC)
         bookmark_state = state_value
