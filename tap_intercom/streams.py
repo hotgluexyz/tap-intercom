@@ -45,7 +45,7 @@ class BaseStream:
         self.catalog = catalog
         self.selected_streams = selected_streams
 
-    def get_records(self, bookmark_datetime: datetime = None, is_parent: bool = False, stream_metadata=None) -> list:
+    def get_records(self, bookmark_datetime: datetime = None, is_parent: bool = False, stream_metadata=None, end_date=None) -> list:
         """
         Returns a list of records for that stream.
 
@@ -168,6 +168,13 @@ class IncrementalStream(BaseStream):
         parent_bookmark_utc = singer.utils.strptime_to_utc(parent_bookmark)
         sync_start_date = parent_bookmark_utc
 
+        # get end_date
+        end_date = None
+        end_date_timestamp = None
+        if config.get('end_date'):
+            end_date = singer.utils.strptime_to_utc(config.get('end_date'))
+            end_date_timestamp = end_date.timestamp() * 1000
+
         is_parent_selected = True
         is_child_selected = False
 
@@ -210,7 +217,7 @@ class IncrementalStream(BaseStream):
         schema_datetimes = find_datetimes_in_schema(stream_schema)
 
         with metrics.record_counter(self.tap_stream_id) as counter:
-            for record in self.get_records(sync_start_date, stream_metadata=stream_metadata):
+            for record in self.get_records(sync_start_date, stream_metadata=stream_metadata, end_date=end_date):
                 transform_times(record, schema_datetimes)
 
                 record_datetime = singer.utils.strptime_to_utc(
@@ -219,7 +226,7 @@ class IncrementalStream(BaseStream):
                     )
 
                 # Write the record if the parent is selected
-                if is_parent_selected and record_datetime >= parent_bookmark_utc:
+                if is_parent_selected and record_datetime >= parent_bookmark_utc and (record_datetime <= end_date if end_date else True):
                     record_counter += 1
                     transformed_record = transform(record,
                                                     stream_schema,
@@ -241,7 +248,7 @@ class IncrementalStream(BaseStream):
                     record_counter = 0
 
                 # Sync child stream, if the child is selected and if we have records greater than the child stream bookmark
-                if has_child and is_child_selected and (record[self.replication_key] >= child_bookmark_ts):
+                if has_child and is_child_selected and (record[self.replication_key] >= child_bookmark_ts) and (record[self.replication_key] <= end_date_timestamp if end_date else True):
                     state = child_stream_obj.sync_substream(record.get('id'), child_schema, child_metadata, child_bookmark_ts, state)
 
             bookmark_date = singer.utils.strftime(max_datetime)
@@ -398,7 +405,7 @@ class Companies(IncrementalStream):
     valid_replication_keys = ['updated_at']
     data_key = 'data'
 
-    def get_records(self, bookmark_datetime=None, is_parent=False, stream_metadata=None) -> Iterator[list]:
+    def get_records(self, bookmark_datetime=None, is_parent=False, stream_metadata=None, end_date=None) -> Iterator[list]:
         scrolling = True
         params = {}
         LOGGER.info("Syncing: {}".format(self.tap_stream_id))
@@ -475,7 +482,7 @@ class CompnaySegments(IncrementalStream):
         }
     data_key = 'segments'
 
-    def get_records(self, bookmark_datetime=None, is_parent=False, stream_metadata=None) -> Iterator[list]:
+    def get_records(self, bookmark_datetime=None, is_parent=False, stream_metadata=None, end_date=None) -> Iterator[list]:
         paging = True
         next_page = None
         LOGGER.info("Syncing: {}".format(self.tap_stream_id))
@@ -510,26 +517,42 @@ class Conversations(IncrementalStream):
     per_page = MAX_PAGE_SIZE
     child = 'conversation_parts'
 
-    def get_records(self, bookmark_datetime=None, is_parent=False, stream_metadata=None) -> Iterator[list]:
+    def get_records(self, bookmark_datetime=None, is_parent=False, stream_metadata=None, end_date=None) -> Iterator[list]:
         paging = True
         starting_after = None
+        date_filter = {
+            'operator': 'OR',
+            'value': [
+                {
+                    'field': self.replication_key,
+                    'operator': '>',
+                    'value': self.dt_to_epoch_seconds(bookmark_datetime)
+                },
+                {
+                    'field': self.replication_key,
+                    'operator': '=',
+                    'value': self.dt_to_epoch_seconds(bookmark_datetime)
+                }
+            ]
+        }
+        if end_date:
+            date_filter = {
+                'operator': 'AND',
+                'value': [
+                    date_filter,
+                    {
+                        'field': self.replication_key,
+                        'operator': '<',
+                        'value': self.dt_to_epoch_seconds(end_date) + 1
+                    }
+                ]
+            }
+            
         search_query = {
             'pagination': {
                 'per_page': self.per_page
             },
-            'query': {
-                'operator': 'OR',
-                'value': [{
-                    'field': self.replication_key,
-                    'operator': '>',
-                    'value': self.dt_to_epoch_seconds(bookmark_datetime)
-                    },
-                    {
-                    'field': self.replication_key,
-                    'operator': '=',
-                    'value': self.dt_to_epoch_seconds(bookmark_datetime)
-                    }]
-                },
+            'query': date_filter,
             "sort": {
                 "field": self.replication_key,
                 "order": "ascending"
@@ -712,26 +735,43 @@ class Contacts(IncrementalStream):
 
         return contact_list
 
-    def get_records(self, bookmark_datetime=None, is_parent=False, stream_metadata=None) -> Iterator[list]:
+    def get_records(self, bookmark_datetime=None, is_parent=False, stream_metadata=None, end_date=None) -> Iterator[list]:
         paging = True
         starting_after = None
+        date_filter = {
+            'operator': 'OR',
+            'value': [
+                {
+                    'field': self.replication_key,
+                    'operator': '>',
+                    'value': self.dt_to_epoch_seconds(bookmark_datetime)
+                },
+                {
+                    'field': self.replication_key,
+                    'operator': '=',
+                    'value': self.dt_to_epoch_seconds(bookmark_datetime)
+                }
+            ]
+        }
+
+        if end_date:
+            date_filter = {
+                'operator': 'AND',
+                'value': [
+                    date_filter,
+                    {
+                        'field': self.replication_key,
+                        'operator': '<',
+                        'value': self.dt_to_epoch_seconds(end_date) + 1
+                    }
+                ]
+            }
+
         search_query = {
             'pagination': {
                 'per_page': self.per_page
             },
-            'query': {
-                'operator': 'OR',
-                'value': [{
-                    'field': self.replication_key,
-                    'operator': '>',
-                    'value': self.dt_to_epoch_seconds(bookmark_datetime)
-                    },
-                    {
-                    'field': self.replication_key,
-                    'operator': '=',
-                    'value': self.dt_to_epoch_seconds(bookmark_datetime)
-                    }]
-                },
+            'query': date_filter,
             'sort': {
                 'field': self.replication_key,
                 'order': 'ascending'
@@ -771,7 +811,7 @@ class Segments(IncrementalStream):
     params = {'include_count': 'true'}
     data_key = 'segments'
 
-    def get_records(self, bookmark_datetime=None, is_parent=False, stream_metadata=None) -> Iterator[list]:
+    def get_records(self, bookmark_datetime=None, is_parent=False, stream_metadata=None, end_date=None) -> Iterator[list]:
         paging = True
         next_page = None
         LOGGER.info("Syncing: {}".format(self.tap_stream_id))
