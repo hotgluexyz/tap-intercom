@@ -17,6 +17,8 @@ from dateutil.parser import parse
 from tap_intercom.client import (IntercomClient, IntercomError)
 from tap_intercom.transform import (transform_json, transform_times, find_datetimes_in_schema)
 
+import concurrent.futures
+
 LOGGER = singer.get_logger()
 
 MAX_PAGE_SIZE = 150
@@ -90,7 +92,7 @@ class BaseStream:
     def dt_to_epoch_seconds(dt_object: datetime) -> float:
         return datetime.datetime.timestamp(dt_object)
 
-    def sync_substream(self, parent_id, stream_schema, stream_metadata, parent_replication_key, state):
+    def sync_substream(self, parent_id, stream_schema, stream_metadata, parent_replication_key, state, is_last=None):
         """
             Sync sub-stream data based on parent id and update the state to parent's replication value
         """
@@ -138,6 +140,23 @@ class IncrementalStream(BaseStream):
     """
     replication_method = 'INCREMENTAL'
     to_write_intermediate_bookmark = False
+
+    def mark_last_item(self, generator):
+        iterator = iter(generator)
+        try:
+            # Attempt to get the first item
+            previous = next(iterator)
+        except StopIteration:
+            # If generator is empty, exit the function
+            return
+        
+        # Iterate through remaining items
+        for current in iterator:
+            yield previous, False
+            previous = current
+        
+        # Yield the last item with `is_last=True`
+        yield previous, True
 
     # Disabled `unused-argument` as it causing pylint error.
     # Method which call this `sync` method is passing unused argument.So, removing argument would not work.
@@ -217,7 +236,7 @@ class IncrementalStream(BaseStream):
         schema_datetimes = find_datetimes_in_schema(stream_schema)
 
         with metrics.record_counter(self.tap_stream_id) as counter:
-            for record in self.get_records(sync_start_date, stream_metadata=stream_metadata, end_date=end_date):
+            for record, is_last in self.mark_last_item(self.get_records(sync_start_date, stream_metadata=stream_metadata, end_date=end_date)):
                 transform_times(record, schema_datetimes)
 
                 record_datetime = singer.utils.strptime_to_utc(
@@ -249,7 +268,7 @@ class IncrementalStream(BaseStream):
 
                 # Sync child stream, if the child is selected and if we have records greater than the child stream bookmark
                 if has_child and is_child_selected and (record[self.replication_key] >= child_bookmark_ts) and (record[self.replication_key] <= end_date_timestamp if end_date else True):
-                    state = child_stream_obj.sync_substream(record.get('id'), child_schema, child_metadata, child_bookmark_ts, state)
+                    state = child_stream_obj.sync_substream(record.get('id'), child_schema, child_metadata, child_bookmark_ts, state, is_last)
 
             bookmark_date = singer.utils.strftime(max_datetime)
             LOGGER.info("FINISHED Syncing: {}, total_records: {}.".format(self.tap_stream_id, counter.value))
@@ -594,55 +613,78 @@ class ConversationParts(BaseStream):
     parent = Conversations
     params = {'display_as': 'plaintext'}
     data_key = 'conversations'
+    max_concurrency = 10
+    record_count = 0
+    conversation_ids = []
 
-    def sync_substream(self, parent_id, stream_schema, stream_metadata, parent_replication_key, state):
+    def get_conversation_parts(self, conversation_id):
+        LOGGER.info("Syncing: {}, parent_stream: {}, parent_id: {}".format(self.tap_stream_id, self.parent.tap_stream_id, conversation_id))
+        call_path = self.path.format(conversation_id)
+        response = self.client.get(call_path, params=self.params)
+        return response
+
+    def sync_substream(self, parent_id, stream_schema, stream_metadata, parent_replication_key, state, is_last):
         """
             Sync sub-stream data based on parent id and update the state to parent's replication value
         """
-        schema_datetimes = find_datetimes_in_schema(stream_schema)
-        LOGGER.info("Syncing: {}, parent_stream: {}, parent_id: {}".format(self.tap_stream_id, self.parent.tap_stream_id, parent_id))
-        call_path = self.path.format(parent_id)
-        response = self.client.get(call_path, params=self.params)
 
-        data_for_transform = {self.data_key: [response]}
-        parent = datetime.datetime.utcfromtimestamp(parent_replication_key/1000)
-        state_value = parent or datetime.datetime(2010, 1, 1)
+        if len(self.conversation_ids) < self.max_concurrency and not is_last:
+            self.conversation_ids.append(parent_id)
+            self.record_count += 1
+            return state
+        else:
+            schema_datetimes = find_datetimes_in_schema(stream_schema)
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=self.max_concurrency
+            ) as executor:
+                futures = {
+                    executor.submit(self.get_conversation_parts, x): x for x in self.conversation_ids
+                }
 
-        state_value = state_value.replace(tzinfo=pytz.UTC)
-        bookmark_state = state_value
+            # Process each future as it completes
+            for future in concurrent.futures.as_completed(futures):
+                response = future.result()
+                data_for_transform = {self.data_key: [response]}
+                parent = datetime.datetime.utcfromtimestamp(parent_replication_key/1000)
+                state_value = parent or datetime.datetime(2010, 1, 1)
 
-        transformed_records = transform_json(data_for_transform, self.tap_stream_id, self.data_key)
-        LOGGER.info("Synced: {}, parent_id: {}, records: {}".format(self.tap_stream_id, parent_id, len(transformed_records)))
-        with metrics.record_counter(self.tap_stream_id) as counter:
-            # Iterate over conversation_parts records
-            for record in transformed_records:
-                transform_times(record, schema_datetimes) # Transfrom datetimes fields of record
+                state_value = state_value.replace(tzinfo=pytz.UTC)
+                bookmark_state = state_value
 
-                transformed_record = transform(record,
-                                                stream_schema,
-                                                integer_datetime_fmt=UNIX_MILLISECONDS_INTEGER_DATETIME_PARSING,
-                                                metadata=stream_metadata)
-                created_at = parse(transformed_record["created_at"])
-                if state_value and created_at > state_value:
-                    if bookmark_state < created_at:
-                        bookmark_state = created_at
-                    singer.write_record(self.tap_stream_id, transformed_record, time_extracted=singer.utils.now())
-                    counter.increment()
-                else:
-                    pass
+                transformed_records = transform_json(data_for_transform, self.tap_stream_id, self.data_key)
+                LOGGER.info("Synced: {}, parent_id: {}, records: {}".format(self.tap_stream_id, parent_id, len(transformed_records)))
+                with metrics.record_counter(self.tap_stream_id) as counter:
+                    # Iterate over conversation_parts records
+                    for record in transformed_records:
+                        transform_times(record, schema_datetimes) # Transfrom datetimes fields of record
 
-            LOGGER.info("FINISHED Syncing: {}, total_records: {}.".format(self.tap_stream_id, counter.value))
+                        transformed_record = transform(record,
+                                                        stream_schema,
+                                                        integer_datetime_fmt=UNIX_MILLISECONDS_INTEGER_DATETIME_PARSING,
+                                                        metadata=stream_metadata)
+                        created_at = parse(transformed_record["created_at"])
+                        if state_value and created_at > state_value:
+                            if bookmark_state < created_at:
+                                bookmark_state = created_at
+                            singer.write_record(self.tap_stream_id, transformed_record, time_extracted=singer.utils.now())
+                            counter.increment()
+                        else:
+                            pass
 
-        # Conversations(parent) are coming in ascending order
-        # so write state with updated_at of conversation after yielding conversation_parts for it.
-        # parent_bookmark_value = self.epoch_milliseconds_to_dt_str(parent_replication_key)
-        state = singer.write_bookmark(state,
-                                        self.tap_stream_id,
-                                        self.replication_key,
-                                        bookmark_state.isoformat())
-        singer.write_state(state)
+                LOGGER.info("FINISHED Syncing: {}, total_records: {}.".format(self.tap_stream_id, counter.value))
 
-        return state
+            # restart conversation_ids
+            self.conversation_ids = []
+            # Conversations(parent) are coming in ascending order
+            # so write state with updated_at of conversation after yielding conversation_parts for it.
+            # parent_bookmark_value = self.epoch_milliseconds_to_dt_str(parent_replication_key)
+            state = singer.write_bookmark(state,
+                                            self.tap_stream_id,
+                                            self.replication_key,
+                                            bookmark_state.isoformat())
+            singer.write_state(state)
+
+            return state
 
 
 class ContactAttributes(FullTableStream):
