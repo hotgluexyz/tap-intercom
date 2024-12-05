@@ -7,7 +7,7 @@ import datetime
 import hashlib
 import time
 import pytz
-from typing import Iterator
+from typing import Iterator, List
 
 import singer
 from singer import Transformer, metrics, metadata, UNIX_MILLISECONDS_INTEGER_DATETIME_PARSING
@@ -178,9 +178,9 @@ class IncrementalStream(BaseStream):
         """
 
         # Check if the current stream has child stream or not
-        has_child = self.child is not None
+        has_child = self.child is not None and len(self.child) > 0
         # Child stream class
-        child_stream = STREAMS.get(self.child)
+        child_streams: List[BaseStream] = [STREAMS.get(child) for child in self.child] if has_child else []
 
         # Get current stream bookmark
         parent_bookmark = singer.get_bookmark(state, self.tap_stream_id, self.replication_key, config['start_date'])
@@ -200,33 +200,42 @@ class IncrementalStream(BaseStream):
         # If the current stream has a child stream, then get the child stream's bookmark
         # And update the sync start date to minimum of parent bookmark or child bookmark
         if has_child:
-            child_bookmark = singer.get_bookmark(state, child_stream.tap_stream_id, self.replication_key, config['start_date'])
-            child_bookmark_utc = singer.utils.strptime_to_utc(child_bookmark)
-            child_bookmark_ts = child_bookmark_utc.timestamp() * 1000
+            child_streams_auxiliary_data = {}
+            for child_stream in child_streams:
+                child_bookmark = singer.get_bookmark(state, child_stream.tap_stream_id, self.replication_key, config['start_date'])
+                child_bookmark_utc = singer.utils.strptime_to_utc(child_bookmark)
+                child_bookmark_ts = child_bookmark_utc.timestamp() * 1000
 
-            is_parent_selected = self.tap_stream_id in self.selected_streams
-            is_child_selected = child_stream.tap_stream_id in self.selected_streams
+                is_parent_selected = self.tap_stream_id in self.selected_streams
+                is_child_selected = child_stream.tap_stream_id in self.selected_streams
 
-            if is_parent_selected and is_child_selected:
-                sync_start_date = min(parent_bookmark_utc, child_bookmark_utc)
-            elif is_parent_selected:
-                sync_start_date = parent_bookmark_utc
-            elif is_child_selected:
-                sync_start_date = singer.utils.strptime_to_utc(child_bookmark)
+                if is_parent_selected and is_child_selected:
+                    sync_start_date = min(parent_bookmark_utc, child_bookmark_utc)
+                elif is_parent_selected:
+                    sync_start_date = parent_bookmark_utc
+                elif is_child_selected:
+                    sync_start_date = singer.utils.strptime_to_utc(child_bookmark)
 
-            # Create child stream object and generate schema
-            child_stream_obj = child_stream(self.client, self.catalog, self.selected_streams)
-            child_stream_ = self.catalog.get_stream(child_stream.tap_stream_id)
-            child_schema = child_stream_.schema.to_dict()
-            child_metadata = metadata.to_map(child_stream_.metadata)
-            if is_child_selected:
-                # Write schema for child stream as it will be synced by the parent stream
-                singer.write_schema(
-                    child_stream.tap_stream_id,
-                    child_schema,
-                    child_stream.key_properties,
-                    child_stream.replication_key
-                )
+                # Create child stream object and generate schema
+                child_stream_obj = child_stream(self.client, self.catalog, self.selected_streams)
+                child_stream_ = self.catalog.get_stream(child_stream.tap_stream_id)
+                child_schema = child_stream_.schema.to_dict()
+                child_metadata = metadata.to_map(child_stream_.metadata)
+                if is_child_selected:
+                    # Write schema for child stream as it will be synced by the parent stream
+                    singer.write_schema(
+                        child_stream.tap_stream_id,
+                        child_schema,
+                        child_stream.key_properties,
+                        child_stream.replication_key
+                    )
+                child_streams_auxiliary_data[child_stream.tap_stream_id] = {
+                    "is_selected": is_child_selected,
+                    "bookmark": child_bookmark_ts,
+                    "schema": child_schema,
+                    "metadata": child_metadata,
+                    "obj": child_stream_obj
+                }
 
         LOGGER.info("Stream: {}, initial max_bookmark_value: {}".format(self.tap_stream_id, sync_start_date))
         max_datetime = sync_start_date
@@ -267,8 +276,15 @@ class IncrementalStream(BaseStream):
                     record_counter = 0
 
                 # Sync child stream, if the child is selected and if we have records greater than the child stream bookmark
-                if has_child and is_child_selected and (record[self.replication_key] >= child_bookmark_ts) and (record[self.replication_key] <= end_date_timestamp if end_date else True):
-                    state = child_stream_obj.sync_substream(record.get('id'), child_schema, child_metadata, child_bookmark_ts, state, is_last)
+                if has_child:
+                    for child_stream_auxiliary_data in child_streams_auxiliary_data.values():
+                        child_stream_obj = child_stream_auxiliary_data.get("obj")
+                        child_schema = child_stream_auxiliary_data.get("schema")
+                        child_metadata = child_stream_auxiliary_data.get("metadata")
+                        child_bookmark_ts = child_stream_auxiliary_data.get("bookmark")
+                        is_child_selected = child_stream_auxiliary_data.get("is_selected")
+                        if is_child_selected and (record[self.replication_key] >= child_bookmark_ts) and (record[self.replication_key] <= end_date_timestamp if end_date else True):
+                            state = child_stream_obj.sync_substream(record.get('id'), child_schema, child_metadata, child_bookmark_ts, state, is_last)
 
             bookmark_date = singer.utils.strftime(max_datetime)
             LOGGER.info("FINISHED Syncing: {}, total_records: {}.".format(self.tap_stream_id, counter.value))
@@ -534,7 +550,7 @@ class Conversations(IncrementalStream):
     params = {'display_as': 'plaintext'}
     data_key = 'conversations'
     per_page = MAX_PAGE_SIZE
-    child = 'conversation_parts'
+    child = ['conversation_parts', 'conversation_details']
 
     def get_records(self, bookmark_datetime=None, is_parent=False, stream_metadata=None, end_date=None) -> Iterator[list]:
         paging = True
@@ -597,6 +613,94 @@ class Conversations(IncrementalStream):
             else:
                 yield from records
 
+class ConversationDetails(BaseStream):
+    """
+    Retrieve conversation details
+    Docs: https://developers.intercom.com/docs/references/rest-api/api.intercom.io/conversations
+    """
+    tap_stream_id = 'conversation_details'
+    key_properties = ['id']
+    path = 'conversations/{}'
+    replication_method = 'INCREMENTAL'
+    replication_key = 'updated_at'
+    valid_replication_keys = ['updated_at']
+    parent = Conversations
+    params = {'display_as': 'plaintext'}
+    data_key = 'conversations'
+    max_concurrency = 10
+    record_count = 0
+    conversation_ids = []
+
+    def get_conversation_parts(self, conversation_id):
+        LOGGER.info("Syncing: {}, parent_stream: {}, parent_id: {}".format(self.tap_stream_id, self.parent.tap_stream_id, conversation_id))
+        call_path = self.path.format(conversation_id)
+        response = self.client.get(call_path, params=self.params)
+        return response
+
+    def sync_substream(self, parent_id, stream_schema, stream_metadata, parent_replication_key, state, is_last):
+        """
+            Sync sub-stream data based on parent id and update the state to parent's replication value
+        """
+
+        if len(self.conversation_ids) < self.max_concurrency:
+            self.conversation_ids.append(parent_id)
+            self.record_count += 1
+            
+        if len(self.conversation_ids) < self.max_concurrency and not is_last:
+            return state
+        else:
+            schema_datetimes = find_datetimes_in_schema(stream_schema)
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=self.max_concurrency
+            ) as executor:
+                futures = {
+                    executor.submit(self.get_conversation_parts, x): x for x in self.conversation_ids
+                }
+
+            # Process each future as it completes
+            for future in concurrent.futures.as_completed(futures):
+                response = future.result()
+                data_for_transform = {self.data_key: [response]}
+                parent = datetime.datetime.utcfromtimestamp(parent_replication_key/1000)
+                state_value = parent or datetime.datetime(2010, 1, 1)
+
+                state_value = state_value.replace(tzinfo=pytz.UTC)
+                bookmark_state = state_value
+
+                transformed_records = transform_json(data_for_transform, self.tap_stream_id, self.data_key)
+                LOGGER.info("Synced: {}, records: {}".format(self.tap_stream_id, len(transformed_records)))
+                with metrics.record_counter(self.tap_stream_id) as counter:
+                    # Iterate over conversation_parts records
+                    for record in transformed_records:
+                        transform_times(record, schema_datetimes) # Transfrom datetimes fields of record
+
+                        transformed_record = transform(record,
+                                                        stream_schema,
+                                                        integer_datetime_fmt=UNIX_MILLISECONDS_INTEGER_DATETIME_PARSING,
+                                                        metadata=stream_metadata)
+                        created_at = parse(transformed_record["created_at"])
+                        if state_value and created_at > state_value:
+                            if bookmark_state < created_at:
+                                bookmark_state = created_at
+                            singer.write_record(self.tap_stream_id, transformed_record, time_extracted=singer.utils.now())
+                            counter.increment()
+                        else:
+                            pass
+
+                LOGGER.info("FINISHED Syncing: {}, total_records: {}.".format(self.tap_stream_id, counter.value))
+
+            # restart conversation_ids
+            self.conversation_ids = []
+            # Conversations(parent) are coming in ascending order
+            # so write state with updated_at of conversation after yielding conversation_parts for it.
+            # parent_bookmark_value = self.epoch_milliseconds_to_dt_str(parent_replication_key)
+            state = singer.write_bookmark(state,
+                                            self.tap_stream_id,
+                                            self.replication_key,
+                                            bookmark_state.isoformat())
+            singer.write_state(state)
+
+            return state
 
 class ConversationParts(BaseStream):
     """
@@ -939,6 +1043,7 @@ STREAMS = {
     "company_attributes": CompanyAttributes,
     "company_segments": CompnaySegments,
     "conversations": Conversations,
+    "conversation_details": ConversationDetails,
     "conversation_parts": ConversationParts,
     "contact_attributes": ContactAttributes,
     "contacts": Contacts,
