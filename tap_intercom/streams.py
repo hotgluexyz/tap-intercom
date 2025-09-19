@@ -732,9 +732,11 @@ class ConversationParts(BaseStream):
             Sync sub-stream data based on parent id and update the state to parent's replication value
         """
 
-        if len(self.conversation_ids) < self.max_concurrency and not is_last:
+        if len(self.conversation_ids) < self.max_concurrency:
             self.conversation_ids.append(parent_id)
             self.record_count += 1
+            
+        if len(self.conversation_ids) < self.max_concurrency and not is_last:
             return state
         else:
             schema_datetimes = find_datetimes_in_schema(stream_schema)
