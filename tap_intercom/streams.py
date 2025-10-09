@@ -844,6 +844,7 @@ class Contacts(IncrementalStream):
     # addressable_list_fields = ['tags', 'notes', 'companies']
     addressable_list_fields = ['tags', 'companies']
     to_write_intermediate_bookmark = True
+    stream_start_time = int(time.time())
 
     def get_addressable_list(self, contact_list: dict, stream_metadata: dict) -> dict:
         params = {
@@ -911,6 +912,18 @@ class Contacts(IncrementalStream):
                         'field': self.replication_key,
                         'operator': '<',
                         'value': self.dt_to_epoch_seconds(end_date) + 1
+                    }
+                ]
+            }
+        else:
+            date_filter = {
+                'operator': 'AND',
+                'value': [
+                    date_filter,
+                    {
+                        'field': self.replication_key,
+                        'operator': '<',
+                        'value': self.stream_start_time + 1
                     }
                 ]
             }
