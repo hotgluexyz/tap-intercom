@@ -13,7 +13,7 @@ class IntercomOAuthAuthenticator(OAuthAuthenticator):
 
     @property
     def oauth_request_body(self) -> dict:
-        return {} # Not needed for Intercom as we are using access_token directly
+        return {}
 
     def update_access_token_locally(self) -> None:
         """Set access_token directly from config - no HTTP refresh needed."""
