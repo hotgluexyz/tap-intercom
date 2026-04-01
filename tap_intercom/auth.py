@@ -13,7 +13,7 @@ class IntercomOAuthAuthenticator(OAuthAuthenticator):
 
     @property
     def oauth_request_body(self) -> dict:
-        pass # Not needed for Intercom as we are using access_token directly
+        return {} # Not needed for Intercom as we are using access_token directly
 
     def update_access_token_locally(self) -> None:
         """Set access_token directly from config - no HTTP refresh needed."""
@@ -24,5 +24,9 @@ class IntercomOAuthAuthenticator(OAuthAuthenticator):
         self._tap._config["expires_in"] = self.expires_in
 
         if self._tap.config_file is not None:
+            with open(self._tap.config_file, "r") as infile:
+                file_config = json.load(infile)
+            file_config["access_token"] = self.access_token
+            file_config["expires_in"] = self.expires_in
             with open(self._tap.config_file, "w") as outfile:
-                json.dump(self._tap._config, outfile, indent=4)
+                json.dump(file_config, outfile, indent=4)
