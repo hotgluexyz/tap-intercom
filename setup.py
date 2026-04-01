@@ -10,8 +10,9 @@ setup(name='tap-intercom',
       py_modules=['tap_intercom'],
       install_requires=[
           'backoff==1.8.0',
-          'requests==2.23.0',
-          'singer-python==5.10.0'
+          'requests>=2.25.1,<3.0.0',
+          'pipelinewise-singer-python==1.2.0',
+          'hotglue-singer-sdk>=1.0.15,<2.0.0'
       ],
       entry_points='''
           [console_scripts]
