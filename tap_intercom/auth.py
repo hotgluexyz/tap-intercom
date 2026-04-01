@@ -19,11 +19,10 @@ class IntercomOAuthAuthenticator(OAuthAuthenticator):
         """Set access_token directly from config - no HTTP refresh needed."""
         self.access_token = self.config["access_token"]
         self.last_refreshed = utc_now()
-        self.expires_in = int(utc_now().timestamp()) + 7 * 24 * 3600
+        self.expires_in = 7 * 24 * 3600
         self._tap._config["access_token"] = self.access_token
         self._tap._config["expires_in"] = self.expires_in
-        
-        # Write the updated config back to the file (only when config was loaded from a path)
+
         if self._tap.config_file is not None:
             with open(self._tap.config_file, "w") as outfile:
                 json.dump(self._tap._config, outfile, indent=4)
