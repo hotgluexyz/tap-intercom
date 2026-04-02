@@ -2,44 +2,77 @@
 
 import singer
 
-from singer import utils
 from tap_intercom.discover import discover
 from tap_intercom.sync import sync
 
+from hotglue_singer_sdk.tap_base import Tap
+from hotglue_singer_sdk.helpers._util import read_json_file
+from hotglue_singer_sdk import typing as th
+from hotglue_singer_sdk.helpers.capabilities import AlertingLevel
+from tap_intercom.auth import IntercomOAuthAuthenticator
+
 LOGGER = singer.get_logger()
 
-REQUIRED_CONFIG_KEYS = [
-    'access_token',
-    'start_date',
-    'user_agent'
-]
 
-def do_discover():
+class IntercomTap(Tap):
+    name = "tap-intercom"
 
-    LOGGER.info('Starting discover')
-    catalog = discover()
-    catalog.dump()
-    LOGGER.info('Finished discover')
+    alerting_level = AlertingLevel.WARNING
 
+    config_jsonschema = th.PropertiesList(
+        th.Property("access_token", th.StringType, required=True),
+        th.Property("start_date", th.StringType, required=True),
+        th.Property("user_agent", th.StringType, required=True),
+        th.Property("client_id", th.StringType),
+        th.Property("client_secret", th.StringType),
+        th.Property("refresh_token", th.StringType),
+        th.Property("request_timeout", th.NumberType),
+        th.Property("end_date", th.StringType),
+    ).to_dict()
 
-@utils.handle_top_exception(LOGGER)
-def main():
-    '''
-    Entrypoint function for tap.
-    '''
-    # Parse command line arguments
-    parsed_args = utils.parse_args(REQUIRED_CONFIG_KEYS)
+    @classmethod
+    def access_token_support(cls, connector=None):
+        """Return authenticator class and auth endpoint for token refresh."""
+        authenticator = IntercomOAuthAuthenticator
+        auth_endpoint = None # Not needed for Intercom as we are using access_token directly
+        return authenticator, auth_endpoint
 
-    # If discover flag was passed, run discovery mode and dump output to stdout
-    if parsed_args.discover:
-        do_discover()
-    # Otherwise run in sync mode
-    else:
-        if parsed_args.catalog:
-            catalog = parsed_args.catalog
+    def discover_streams(self):
+        return []
+
+    def run_discovery(self):
+        LOGGER.info('Starting discover')
+        catalog = discover()
+        catalog.dump()
+        LOGGER.info('Finished discover')
+
+    def run_sync(self, catalog=None, state=None):
+        self.register_streams_from_catalog(catalog)
+        self.register_state_from_file(state)
+
+        config = dict(self.config)
+
+        if isinstance(catalog, str):
+            catalog_dict = read_json_file(catalog)
+        elif isinstance(catalog, dict):
+            catalog_dict = catalog
         else:
-            catalog = discover()
-        sync(parsed_args.config, parsed_args.state, catalog)
+            catalog_dict = self.input_catalog.to_dict() if self.input_catalog else None
+
+        if catalog_dict:
+            from singer.catalog import Catalog
+            catalog_obj = Catalog.from_dict(catalog_dict)
+        else:
+            catalog_obj = discover()
+
+        state_dict = read_json_file(state) if isinstance(state, str) else (state or {})
+
+        sync(config, state_dict, catalog_obj)
+
+
+def main():
+    IntercomTap.cli()
+
 
 if __name__ == '__main__':
     main()
