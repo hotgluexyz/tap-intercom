@@ -4,7 +4,7 @@ import datetime as dt
 from unittest import mock
 from tap_intercom.client import IntercomClient, IntercomError
 from parameterized import parameterized
-from tap_intercom.streams import AdminList, BaseStream, Admins,Companies, CompanyAttributes,Contacts, ContactAttributes,CompnaySegments, Conversations, Segments, Tags, Teams,ConversationParts
+from tap_intercom.streams import AdminList, BaseStream, Admins,Companies, CompanyAttributes,Contacts, ContactAttributes,CompanySegments, Conversations, Segments, Tags, Teams,ConversationParts
 
 class TestData(unittest.TestCase):
     
@@ -12,7 +12,7 @@ class TestData(unittest.TestCase):
     @parameterized.expand([
         ['Companies',[Companies, [{'data':'', 'scroll_param':''},{'data':''}]], []],
         ['CompanyAttributes',[CompanyAttributes, [{'data':['test1'],'pages':{'next':'abc'}},{'data':['test2'],'pages':{'next':''}}]],['test1','test2']],
-        ['CompanySegments',[CompnaySegments,[{'segments':['test1'],'pages':{'next':'abc'}},{'segments':['test2'],'pages':{'next':''}}]],['test1','test2']],
+        ['CompanySegments',[CompanySegments,[{'segments':['test1'],'pages':{'next':'abc'}},{'segments':['test2'],'pages':{'next':''}}]],['test1','test2']],
         ['Segments',[Segments,[{'segments':['test1'],'pages':{'next':'abc'}},{'segments':['test2'],'pages':{'next':''}}]],['test1','test2']],
         ['ContactAttributes',[ContactAttributes,[{'data':['test1'],'pages':{'next':'abc'}},{'data':['test2'],'pages':{'next':''}}]],['test1','test2']],
         ['Tags',[Tags,[{'data':['test1'],'pages':{'next':'abc'}},{'data':['test2'],'pages':{'next':''}}]],['test1','test2']],
