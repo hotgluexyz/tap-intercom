@@ -974,7 +974,6 @@ class DataExport(BaseStream):
     Export outbound content engagement data via Intercom's async export API.
     """
     tap_stream_id = 'data_export'
-    key_properties = ['_sdc_record_hash']
     replication_method = 'INCREMENTAL'
     replication_key = 'created_at'
     valid_replication_keys = ['created_at']
@@ -1021,37 +1020,25 @@ class DataExport(BaseStream):
             payload = self._download_export_payload(export_job)
             max_parent_bookmark = max(max_parent_bookmark, window_end)
 
-            for source_file, row_number, row in self._iter_export_rows(payload):
+            for source_file, row in self._iter_export_rows(payload):
                 prefix = self._derive_prefix(source_file)
                 stream_id = "{}{}".format(self.STREAM_PREFIX, prefix)
                 replication_key = self.DEFAULT_REPLICATION_KEY
-                # replication_dt = window_end
-
-                # record = self._normalize_row(
-                #     row=row,
-                #     source_file=source_file,
-                #     row_number=row_number,
-                #     stream_id=stream_id,
-                #     job_identifier=export_job.get("job_identifier"),
-                #     replication_key=replication_key,
-                #     replication_dt=replication_dt
-                # )
-                record = row
 
                 stream_schema_obj = stream_schema_cache.get(stream_id)
-                candidate_schema = self._build_dynamic_schema(record)
+                candidate_schema = self._build_dynamic_schema(row)
                 if stream_schema_obj is None:
                     stream_schema_cache[stream_id] = candidate_schema
-                    singer.write_schema(stream_id, candidate_schema, ['_sdc_record_hash'], replication_key)
+                    singer.write_schema(stream_id, candidate_schema, "", replication_key)
                 else:
                     current_keys = set(stream_schema_obj.get("properties", {}).keys())
                     candidate_keys = set(candidate_schema.get("properties", {}).keys())
                     if candidate_keys != current_keys:
                         merged_schema = self._merge_schemas(stream_schema_obj, candidate_schema)
                         stream_schema_cache[stream_id] = merged_schema
-                        singer.write_schema(stream_id, merged_schema, ['_sdc_record_hash'], replication_key)
+                        singer.write_schema(stream_id, merged_schema, "", replication_key)
 
-                singer.write_record(stream_id, record, time_extracted=singer.utils.now())
+                singer.write_record(stream_id, row, time_extracted=singer.utils.now())
 
             window_start = window_end
 
@@ -1156,7 +1143,7 @@ class DataExport(BaseStream):
                 return response.content
 
             if attempt < self.DOWNLOAD_MAX_ATTEMPTS and (response.status_code == 429 or response.status_code >= 500):
-                sleep_seconds = min(2 ** attempt, 30)
+                sleep_seconds = min(self.POLL_SLEEP_SECONDS ** attempt, 60)
                 time.sleep(sleep_seconds)
                 continue
 
@@ -1174,26 +1161,21 @@ class DataExport(BaseStream):
                     if not filename.lower().endswith(".csv"):
                         continue
                     with zip_archive.open(filename) as file_obj:
-                        for row_number, row in self._read_csv_rows(file_obj):
-                            yield filename, row_number, row
+                        for row in self._read_csv_rows(file_obj):
+                            yield filename, row
             return
 
         payload_buffer.seek(0)
-        try:
-            with gzip.GzipFile(fileobj=payload_buffer, mode="rb") as gz_file:
-                for row_number, row in self._read_csv_rows(gz_file):
-                    yield "data_export.csv", row_number, row
-        except OSError:
-            payload_buffer.seek(0)
-            for row_number, row in self._read_csv_rows(payload_buffer):
-                yield "data_export.csv", row_number, row
+        with gzip.GzipFile(fileobj=payload_buffer, mode="rb") as gz_file:
+            for row in self._read_csv_rows(gz_file):
+                yield "data_export.csv", row
 
     @staticmethod
     def _read_csv_rows(binary_file):
         text_stream = io.TextIOWrapper(binary_file, encoding="utf-8")
         csv_reader = csv.DictReader(text_stream)
-        for row_number, row in enumerate(csv_reader, 1):
-            yield row_number, row
+        for row in csv_reader:
+            yield row
 
     @staticmethod
     def _derive_prefix(source_file):
@@ -1204,25 +1186,6 @@ class DataExport(BaseStream):
         normalized = re.sub(r"[^a-z0-9_]+", "_", raw_prefix.lower())
         normalized = re.sub(r"_+", "_", normalized).strip("_")
         return normalized or "unknown"
-
-    @staticmethod
-    def _normalize_row(row, source_file, row_number, stream_id, job_identifier, replication_key, replication_dt):
-        normalized = {}
-        for key, value in row.items():
-            normalized_key = key.strip() if isinstance(key, str) else str(key)
-            normalized[normalized_key] = value if value != "" else None
-
-        stable_fields = sorted(
-            ["{}={}".format(k, normalized.get(k)) for k in normalized.keys() if not k.startswith("_sdc_")]
-        )
-        hash_basis = "{}|{}|{}".format(stream_id, source_file, "|".join(stable_fields))
-        normalized["_sdc_record_hash"] = hashlib.sha256(hash_basis.encode("utf-8")).hexdigest()
-        normalized["_sdc_source_file"] = source_file
-        normalized["_sdc_row_number"] = row_number
-        normalized["_sdc_job_identifier"] = job_identifier
-        normalized["_sdc_replication_key"] = replication_key
-        normalized["_sdc_replication_value"] = singer.utils.strftime(replication_dt)
-        return normalized
 
     @staticmethod
     def _build_dynamic_schema(record):
