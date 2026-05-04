@@ -1026,25 +1026,14 @@ class DataExport(BaseStream):
                 replication_key = self.DEFAULT_REPLICATION_KEY
 
                 stream_schema_obj = stream_schema_cache.get(stream_id)
-                candidate_schema = self._build_dynamic_schema(row)
                 if stream_schema_obj is None:
+                    candidate_schema = self._build_dynamic_schema(row)
                     stream_schema_cache[stream_id] = candidate_schema
                     singer.write_schema(stream_id, candidate_schema, [], replication_key)
-                else:
-                    current_keys = set(stream_schema_obj.get("properties", {}).keys())
-                    candidate_keys = set(candidate_schema.get("properties", {}).keys())
-                    if candidate_keys != current_keys:
-                        merged_schema = self._merge_schemas(stream_schema_obj, candidate_schema)
-                        stream_schema_cache[stream_id] = merged_schema
-                        singer.write_schema(stream_id, merged_schema, [], replication_key)
 
                 singer.write_record(stream_id, row, time_extracted=singer.utils.now())
 
             window_start = window_end
-
-        # Keep only a single bookmark for this stream.
-        sync_end_time = singer.utils.now()
-        max_parent_bookmark = max(max_parent_bookmark, sync_end_time)
 
         state = singer.write_bookmark(
             state,
