@@ -511,7 +511,7 @@ class CompanyAttributes(FullTableStream):
             yield from response.get(self.data_key,  [])
 
 
-class CompnaySegments(IncrementalStream):
+class CompanySegments(IncrementalStream):
     """
     Retrieve company segments
 
@@ -982,18 +982,10 @@ class DataExport(BaseStream):
 
     MAX_WINDOW_DAYS = 90
     POLL_MAX_ATTEMPTS = 60
-    POLL_SLEEP_SECONDS = 10
+    POLL_SLEEP_SECONDS = 1
     DOWNLOAD_MAX_ATTEMPTS = 5
     STREAM_PREFIX = "data_export_"
     DEFAULT_REPLICATION_KEY = "created_at"
-
-    STREAM_REPLICATION_KEYS = {
-        "overview": "created_at",
-        "receipt": "received_at",
-        "hard_bounce": "hard_bounced_at",
-        "open": "opened_at",
-        "reply": "replied_at",
-    }
 
     # pylint: disable=too-many-locals,too-many-branches,too-many-statements,unused-argument
     def sync(self,
@@ -1013,8 +1005,6 @@ class DataExport(BaseStream):
             return state
 
         max_parent_bookmark = start_dt
-        stream_bookmarks = {}
-        stream_replication_keys = {}
         stream_schema_cache = {}
 
         window_start = start_dt
@@ -1034,19 +1024,19 @@ class DataExport(BaseStream):
             for source_file, row_number, row in self._iter_export_rows(payload):
                 prefix = self._derive_prefix(source_file)
                 stream_id = "{}{}".format(self.STREAM_PREFIX, prefix)
-                replication_key = self.STREAM_REPLICATION_KEYS.get(prefix, self.DEFAULT_REPLICATION_KEY)
-                replication_dt = self._get_row_replication_datetime(row, replication_key, fallback_dt=window_end)
-                stream_replication_keys[stream_id] = replication_key
+                replication_key = self.DEFAULT_REPLICATION_KEY
+                # replication_dt = window_end
 
-                record = self._normalize_row(
-                    row=row,
-                    source_file=source_file,
-                    row_number=row_number,
-                    stream_id=stream_id,
-                    job_identifier=export_job.get("job_identifier"),
-                    replication_key=replication_key,
-                    replication_dt=replication_dt
-                )
+                # record = self._normalize_row(
+                #     row=row,
+                #     source_file=source_file,
+                #     row_number=row_number,
+                #     stream_id=stream_id,
+                #     job_identifier=export_job.get("job_identifier"),
+                #     replication_key=replication_key,
+                #     replication_dt=replication_dt
+                # )
+                record = row
 
                 stream_schema_obj = stream_schema_cache.get(stream_id)
                 candidate_schema = self._build_dynamic_schema(record)
@@ -1062,18 +1052,12 @@ class DataExport(BaseStream):
                         singer.write_schema(stream_id, merged_schema, ['_sdc_record_hash'], replication_key)
 
                 singer.write_record(stream_id, record, time_extracted=singer.utils.now())
-                stream_bookmarks[stream_id] = max(stream_bookmarks.get(stream_id, start_dt), replication_dt)
-                max_parent_bookmark = max(max_parent_bookmark, replication_dt)
 
             window_start = window_end
 
-        for stream_id, bookmark_dt in stream_bookmarks.items():
-            state = singer.write_bookmark(
-                state,
-                stream_id,
-                stream_replication_keys.get(stream_id, self.DEFAULT_REPLICATION_KEY),
-                singer.utils.strftime(bookmark_dt)
-            )
+        # Keep only a single bookmark for this stream.
+        sync_end_time = singer.utils.now()
+        max_parent_bookmark = max(max_parent_bookmark, sync_end_time)
 
         state = singer.write_bookmark(
             state,
@@ -1086,19 +1070,14 @@ class DataExport(BaseStream):
 
     def _get_created_after_from_state(self, state, configured_start_date):
         configured_start = singer.utils.strptime_to_utc(configured_start_date)
-        highest = configured_start
+        data_export_bookmark = state.get("bookmarks", {}).get(self.tap_stream_id, {})
+        if isinstance(data_export_bookmark, dict):
+            bookmark_value = data_export_bookmark.get(self.replication_key)
+        else:
+            bookmark_value = data_export_bookmark
 
-        for stream_id, bookmark in state.get("bookmarks", {}).items():
-            if not stream_id.startswith(self.STREAM_PREFIX) and stream_id != self.tap_stream_id:
-                continue
-
-            values = [bookmark] if isinstance(bookmark, str) else list(bookmark.values())
-            for value in values:
-                bookmark_dt = self._parse_bookmark_value(value)
-                if bookmark_dt:
-                    highest = max(highest, bookmark_dt)
-
-        return highest
+        bookmark_dt = self._parse_bookmark_value(bookmark_value)
+        return bookmark_dt if bookmark_dt else configured_start
 
     @staticmethod
     def _parse_bookmark_value(value):
@@ -1225,36 +1204,6 @@ class DataExport(BaseStream):
         normalized = re.sub(r"[^a-z0-9_]+", "_", raw_prefix.lower())
         normalized = re.sub(r"_+", "_", normalized).strip("_")
         return normalized or "unknown"
-
-    def _get_row_replication_datetime(self, row, replication_key, fallback_dt):
-        value = row.get(replication_key) or row.get(self.DEFAULT_REPLICATION_KEY)
-        dt_obj = self._coerce_to_datetime(value)
-        return dt_obj if dt_obj else fallback_dt
-
-    @staticmethod
-    def _coerce_to_datetime(value):
-        if value in (None, ""):
-            return None
-
-        if isinstance(value, (int, float)):
-            timestamp = float(value)
-            if timestamp > 10**12:
-                timestamp = timestamp / 1000.0
-            return datetime.datetime.utcfromtimestamp(timestamp).replace(tzinfo=pytz.UTC)
-
-        value_str = str(value).strip()
-        if value_str.isdigit():
-            return DataExport._coerce_to_datetime(int(value_str))
-
-        try:
-            parsed = parse(value_str)
-            if parsed.tzinfo is None:
-                parsed = parsed.replace(tzinfo=pytz.UTC)
-            else:
-                parsed = parsed.astimezone(pytz.UTC)
-            return parsed
-        except Exception: # pylint: disable=broad-except
-            return None
 
     @staticmethod
     def _normalize_row(row, source_file, row_number, stream_id, job_identifier, replication_key, replication_dt):
@@ -1397,7 +1346,7 @@ STREAMS = {
     "admins": Admins,
     "companies": Companies,
     "company_attributes": CompanyAttributes,
-    "company_segments": CompnaySegments,
+    "company_segments": CompanySegments,
     "conversations": Conversations,
     "conversation_details": ConversationDetails,
     "conversation_parts": ConversationParts,
