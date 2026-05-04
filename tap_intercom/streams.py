@@ -4,8 +4,13 @@ This module defines the stream classes and their individual sync logic.
 
 
 import datetime
+import csv
+import gzip
 import hashlib
+import io
+import re
 import time
+import zipfile
 import pytz
 from typing import Iterator, List
 
@@ -14,7 +19,13 @@ from singer import Transformer, metrics, metadata, UNIX_MILLISECONDS_INTEGER_DAT
 from singer.transform import transform, unix_milliseconds_to_datetime
 from dateutil.parser import parse
 
-from tap_intercom.client import (IntercomClient, IntercomError)
+from tap_intercom.client import (
+    API_VERSION,
+    IntercomBadRequestError,
+    IntercomClient,
+    IntercomError,
+    raise_for_error,
+)
 from tap_intercom.transform import (transform_json, transform_times, find_datetimes_in_schema)
 
 import concurrent.futures
@@ -958,6 +969,336 @@ class Contacts(IncrementalStream):
             yield from records
 
 
+class DataExport(BaseStream):
+    """
+    Export outbound content engagement data via Intercom's async export API.
+    """
+    tap_stream_id = 'data_export'
+    key_properties = ['_sdc_record_hash']
+    replication_method = 'INCREMENTAL'
+    replication_key = 'created_at'
+    valid_replication_keys = ['created_at']
+    path = 'export/content/data'
+
+    MAX_WINDOW_DAYS = 90
+    POLL_MAX_ATTEMPTS = 60
+    POLL_SLEEP_SECONDS = 10
+    DOWNLOAD_MAX_ATTEMPTS = 5
+    STREAM_PREFIX = "data_export_"
+    DEFAULT_REPLICATION_KEY = "created_at"
+
+    STREAM_REPLICATION_KEYS = {
+        "overview": "created_at",
+        "receipt": "received_at",
+        "hard_bounce": "hard_bounced_at",
+        "open": "opened_at",
+        "reply": "replied_at",
+    }
+
+    # pylint: disable=too-many-locals,too-many-branches,too-many-statements,unused-argument
+    def sync(self,
+             state: dict,
+             stream_schema: dict,
+             stream_metadata: dict,
+             config: dict,
+             transformer: Transformer) -> dict:
+        """
+        Run async export jobs in <=90 day windows and emit dynamic streams per CSV prefix.
+        """
+        start_dt = self._get_created_after_from_state(state, config['start_date'])
+        end_dt = singer.utils.strptime_to_utc(config.get('end_date')) if config.get('end_date') else singer.utils.now()
+
+        if start_dt >= end_dt:
+            LOGGER.info("Skipping data_export: start is not lower than end.")
+            return state
+
+        max_parent_bookmark = start_dt
+        stream_bookmarks = {}
+        stream_replication_keys = {}
+        stream_schema_cache = {}
+
+        window_start = start_dt
+        while window_start < end_dt:
+            window_end = min(window_start + datetime.timedelta(days=self.MAX_WINDOW_DAYS), end_dt)
+            export_job = self._create_export_job(window_start, window_end)
+            export_job = self._poll_export_job(export_job.get("job_identifier"))
+
+            if export_job.get("status") == "no_data":
+                max_parent_bookmark = max(max_parent_bookmark, window_end)
+                window_start = window_end
+                continue
+
+            payload = self._download_export_payload(export_job)
+            max_parent_bookmark = max(max_parent_bookmark, window_end)
+
+            for source_file, row_number, row in self._iter_export_rows(payload):
+                prefix = self._derive_prefix(source_file)
+                stream_id = "{}{}".format(self.STREAM_PREFIX, prefix)
+                replication_key = self.STREAM_REPLICATION_KEYS.get(prefix, self.DEFAULT_REPLICATION_KEY)
+                replication_dt = self._get_row_replication_datetime(row, replication_key, fallback_dt=window_end)
+                stream_replication_keys[stream_id] = replication_key
+
+                record = self._normalize_row(
+                    row=row,
+                    source_file=source_file,
+                    row_number=row_number,
+                    stream_id=stream_id,
+                    job_identifier=export_job.get("job_identifier"),
+                    replication_key=replication_key,
+                    replication_dt=replication_dt
+                )
+
+                stream_schema_obj = stream_schema_cache.get(stream_id)
+                candidate_schema = self._build_dynamic_schema(record)
+                if stream_schema_obj is None:
+                    stream_schema_cache[stream_id] = candidate_schema
+                    singer.write_schema(stream_id, candidate_schema, ['_sdc_record_hash'], replication_key)
+                else:
+                    current_keys = set(stream_schema_obj.get("properties", {}).keys())
+                    candidate_keys = set(candidate_schema.get("properties", {}).keys())
+                    if candidate_keys != current_keys:
+                        merged_schema = self._merge_schemas(stream_schema_obj, candidate_schema)
+                        stream_schema_cache[stream_id] = merged_schema
+                        singer.write_schema(stream_id, merged_schema, ['_sdc_record_hash'], replication_key)
+
+                singer.write_record(stream_id, record, time_extracted=singer.utils.now())
+                stream_bookmarks[stream_id] = max(stream_bookmarks.get(stream_id, start_dt), replication_dt)
+                max_parent_bookmark = max(max_parent_bookmark, replication_dt)
+
+            window_start = window_end
+
+        for stream_id, bookmark_dt in stream_bookmarks.items():
+            state = singer.write_bookmark(
+                state,
+                stream_id,
+                stream_replication_keys.get(stream_id, self.DEFAULT_REPLICATION_KEY),
+                singer.utils.strftime(bookmark_dt)
+            )
+
+        state = singer.write_bookmark(
+            state,
+            self.tap_stream_id,
+            self.replication_key,
+            singer.utils.strftime(max_parent_bookmark)
+        )
+
+        return state
+
+    def _get_created_after_from_state(self, state, configured_start_date):
+        configured_start = singer.utils.strptime_to_utc(configured_start_date)
+        highest = configured_start
+
+        for stream_id, bookmark in state.get("bookmarks", {}).items():
+            if not stream_id.startswith(self.STREAM_PREFIX) and stream_id != self.tap_stream_id:
+                continue
+
+            values = [bookmark] if isinstance(bookmark, str) else list(bookmark.values())
+            for value in values:
+                bookmark_dt = self._parse_bookmark_value(value)
+                if bookmark_dt:
+                    highest = max(highest, bookmark_dt)
+
+        return highest
+
+    @staticmethod
+    def _parse_bookmark_value(value):
+        try:
+            return singer.utils.strptime_to_utc(value)
+        except Exception: # pylint: disable=broad-except
+            return None
+
+    def _create_export_job(self, created_after_dt, created_before_dt):
+        created_after = int(created_after_dt.timestamp())
+        created_before = int(created_before_dt.timestamp())
+        payload = {
+            "created_at_after": created_after,
+            "created_at_before": created_before
+        }
+
+        try:
+            response = self.client.post(self.path, json=payload)
+        except IntercomBadRequestError as exc:
+            error_message = str(exc)
+            if "export period is longer than 90 days" in error_message:
+                raise IntercomError(
+                    "Invalid Data Export window: created_at_after={} created_at_before={} exceeds 90 days.".format(
+                        created_after, created_before
+                    )
+                ) from None
+            raise
+
+        if not response.get("job_identifier"):
+            raise IntercomError("Data export create job response missing job_identifier.")
+
+        return response
+
+    def _poll_export_job(self, job_identifier):
+        if not job_identifier:
+            raise IntercomError("Cannot poll data export status without job_identifier.")
+
+        status_path = "{}/{}".format(self.path, job_identifier)
+        for _ in range(self.POLL_MAX_ATTEMPTS):
+            response = self.client.get(status_path)
+            status = response.get("status")
+
+            if status in {"completed", "no_data"}:
+                return response
+            if status in {"failed", "canceled"}:
+                raise IntercomError("Data export job {} finished with status '{}'.".format(job_identifier, status))
+            if status not in {"pending", "in_progress"}:
+                raise IntercomError("Data export job {} returned unknown status '{}'.".format(job_identifier, status))
+
+            time.sleep(self.POLL_SLEEP_SECONDS)
+
+        raise IntercomError("Data export job {} polling timed out.".format(job_identifier))
+
+    def _download_export_payload(self, export_job):
+        job_identifier = export_job.get("job_identifier")
+        download_url = export_job.get("download_url")
+        if not download_url:
+            download_url = "{}/download/content/data/{}".format(self.client.base_url, job_identifier)
+
+        if not download_url.startswith("http"):
+            download_url = "{}/{}".format(self.client.base_url.rstrip("/"), download_url.lstrip("/"))
+
+        session = getattr(self.client, "_IntercomClient__session")
+        access_token = getattr(self.client, "_IntercomClient__access_token")
+        request_timeout = getattr(self.client, "_IntercomClient__request_timeout")
+
+        headers = {
+            "Authorization": "Bearer {}".format(access_token),
+            "Accept": "application/octet-stream",
+            "Intercom-Version": API_VERSION
+        }
+
+        for attempt in range(1, self.DOWNLOAD_MAX_ATTEMPTS + 1):
+            response = session.get(download_url, headers=headers, timeout=request_timeout)
+            if response.status_code == 200:
+                return response.content
+
+            if attempt < self.DOWNLOAD_MAX_ATTEMPTS and (response.status_code == 429 or response.status_code >= 500):
+                sleep_seconds = min(2 ** attempt, 30)
+                time.sleep(sleep_seconds)
+                continue
+
+            raise_for_error(response)
+
+        raise IntercomError("Data export download failed after retries.")
+
+    def _iter_export_rows(self, payload):
+        payload_buffer = io.BytesIO(payload)
+
+        if zipfile.is_zipfile(payload_buffer):
+            payload_buffer.seek(0)
+            with zipfile.ZipFile(payload_buffer) as zip_archive:
+                for filename in sorted(zip_archive.namelist()):
+                    if not filename.lower().endswith(".csv"):
+                        continue
+                    with zip_archive.open(filename) as file_obj:
+                        for row_number, row in self._read_csv_rows(file_obj):
+                            yield filename, row_number, row
+            return
+
+        payload_buffer.seek(0)
+        try:
+            with gzip.GzipFile(fileobj=payload_buffer, mode="rb") as gz_file:
+                for row_number, row in self._read_csv_rows(gz_file):
+                    yield "data_export.csv", row_number, row
+        except OSError:
+            payload_buffer.seek(0)
+            for row_number, row in self._read_csv_rows(payload_buffer):
+                yield "data_export.csv", row_number, row
+
+    @staticmethod
+    def _read_csv_rows(binary_file):
+        text_stream = io.TextIOWrapper(binary_file, encoding="utf-8")
+        csv_reader = csv.DictReader(text_stream)
+        for row_number, row in enumerate(csv_reader, 1):
+            yield row_number, row
+
+    @staticmethod
+    def _derive_prefix(source_file):
+        filename = source_file.split("/")[-1]
+        name_without_ext = filename.rsplit(".", 1)[0]
+        parts = name_without_ext.split("_")
+        raw_prefix = "_".join(parts[:-1]) if len(parts) > 1 else name_without_ext
+        normalized = re.sub(r"[^a-z0-9_]+", "_", raw_prefix.lower())
+        normalized = re.sub(r"_+", "_", normalized).strip("_")
+        return normalized or "unknown"
+
+    def _get_row_replication_datetime(self, row, replication_key, fallback_dt):
+        value = row.get(replication_key) or row.get(self.DEFAULT_REPLICATION_KEY)
+        dt_obj = self._coerce_to_datetime(value)
+        return dt_obj if dt_obj else fallback_dt
+
+    @staticmethod
+    def _coerce_to_datetime(value):
+        if value in (None, ""):
+            return None
+
+        if isinstance(value, (int, float)):
+            timestamp = float(value)
+            if timestamp > 10**12:
+                timestamp = timestamp / 1000.0
+            return datetime.datetime.utcfromtimestamp(timestamp).replace(tzinfo=pytz.UTC)
+
+        value_str = str(value).strip()
+        if value_str.isdigit():
+            return DataExport._coerce_to_datetime(int(value_str))
+
+        try:
+            parsed = parse(value_str)
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=pytz.UTC)
+            else:
+                parsed = parsed.astimezone(pytz.UTC)
+            return parsed
+        except Exception: # pylint: disable=broad-except
+            return None
+
+    @staticmethod
+    def _normalize_row(row, source_file, row_number, stream_id, job_identifier, replication_key, replication_dt):
+        normalized = {}
+        for key, value in row.items():
+            normalized_key = key.strip() if isinstance(key, str) else str(key)
+            normalized[normalized_key] = value if value != "" else None
+
+        stable_fields = sorted(
+            ["{}={}".format(k, normalized.get(k)) for k in normalized.keys() if not k.startswith("_sdc_")]
+        )
+        hash_basis = "{}|{}|{}".format(stream_id, source_file, "|".join(stable_fields))
+        normalized["_sdc_record_hash"] = hashlib.sha256(hash_basis.encode("utf-8")).hexdigest()
+        normalized["_sdc_source_file"] = source_file
+        normalized["_sdc_row_number"] = row_number
+        normalized["_sdc_job_identifier"] = job_identifier
+        normalized["_sdc_replication_key"] = replication_key
+        normalized["_sdc_replication_value"] = singer.utils.strftime(replication_dt)
+        return normalized
+
+    @staticmethod
+    def _build_dynamic_schema(record):
+        properties = {}
+        for key in record.keys():
+            properties[key] = {"type": ["null", "string", "integer", "number", "boolean"]}
+
+        return {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": properties
+        }
+
+    @staticmethod
+    def _merge_schemas(schema_left, schema_right):
+        merged = {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {}
+        }
+        merged["properties"].update(schema_left.get("properties", {}))
+        merged["properties"].update(schema_right.get("properties", {}))
+        return merged
+
+
 class Segments(IncrementalStream):
     """
     Retrieve segments
@@ -1062,6 +1403,7 @@ STREAMS = {
     "conversation_parts": ConversationParts,
     "contact_attributes": ContactAttributes,
     "contacts": Contacts,
+    "data_export": DataExport,
     "segments": Segments,
     "tags": Tags,
     "teams": Teams
