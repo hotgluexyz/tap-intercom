@@ -1188,18 +1188,6 @@ class DataExport(BaseStream):
             "properties": properties
         }
 
-    @staticmethod
-    def _merge_schemas(schema_left, schema_right):
-        merged = {
-            "type": "object",
-            "additionalProperties": False,
-            "properties": {}
-        }
-        merged["properties"].update(schema_left.get("properties", {}))
-        merged["properties"].update(schema_right.get("properties", {}))
-        return merged
-
-
 class Segments(IncrementalStream):
     """
     Retrieve segments
