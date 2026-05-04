@@ -986,7 +986,6 @@ class DataExport(BaseStream):
     STREAM_PREFIX = "data_export_"
     DEFAULT_REPLICATION_KEY = "created_at"
 
-    # pylint: disable=too-many-locals,too-many-branches,too-many-statements,unused-argument
     def sync(self,
              state: dict,
              stream_schema: dict,
@@ -1070,7 +1069,7 @@ class DataExport(BaseStream):
     def _parse_bookmark_value(value):
         try:
             return singer.utils.strptime_to_utc(value)
-        except Exception: # pylint: disable=broad-except
+        except Exception:
             return None
 
     def _create_export_job(self, created_after_dt, created_before_dt):
