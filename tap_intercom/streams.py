@@ -983,6 +983,7 @@ class DataExport(BaseStream):
     POLL_MAX_ATTEMPTS = 60
     POLL_SLEEP_SECONDS = 1
     DOWNLOAD_MAX_ATTEMPTS = 5
+    DOWNLOAD_SLEEP_SECONDS = 2
     STREAM_PREFIX = "data_export_"
     DEFAULT_REPLICATION_KEY = "created_at"
 
@@ -1028,14 +1029,14 @@ class DataExport(BaseStream):
                 candidate_schema = self._build_dynamic_schema(row)
                 if stream_schema_obj is None:
                     stream_schema_cache[stream_id] = candidate_schema
-                    singer.write_schema(stream_id, candidate_schema, "", replication_key)
+                    singer.write_schema(stream_id, candidate_schema, [], replication_key)
                 else:
                     current_keys = set(stream_schema_obj.get("properties", {}).keys())
                     candidate_keys = set(candidate_schema.get("properties", {}).keys())
                     if candidate_keys != current_keys:
                         merged_schema = self._merge_schemas(stream_schema_obj, candidate_schema)
                         stream_schema_cache[stream_id] = merged_schema
-                        singer.write_schema(stream_id, merged_schema, "", replication_key)
+                        singer.write_schema(stream_id, merged_schema, [], replication_key)
 
                 singer.write_record(stream_id, row, time_extracted=singer.utils.now())
 
@@ -1142,7 +1143,7 @@ class DataExport(BaseStream):
                 return response.content
 
             if attempt < self.DOWNLOAD_MAX_ATTEMPTS and (response.status_code == 429 or response.status_code >= 500):
-                sleep_seconds = min(self.POLL_SLEEP_SECONDS ** attempt, 60)
+                sleep_seconds = min(self.DOWNLOAD_SLEEP_SECONDS ** attempt, 60)
                 time.sleep(sleep_seconds)
                 continue
 
