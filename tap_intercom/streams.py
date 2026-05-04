@@ -18,6 +18,7 @@ import singer
 from singer import Transformer, metrics, metadata, UNIX_MILLISECONDS_INTEGER_DATETIME_PARSING
 from singer.transform import transform, unix_milliseconds_to_datetime
 from dateutil.parser import parse
+from requests.exceptions import ConnectionError, Timeout
 
 from tap_intercom.client import (
     API_VERSION,
@@ -1127,7 +1128,15 @@ class DataExport(BaseStream):
         }
 
         for attempt in range(1, self.DOWNLOAD_MAX_ATTEMPTS + 1):
-            response = session.get(download_url, headers=headers, timeout=request_timeout)
+            try:
+                response = session.get(download_url, headers=headers, timeout=request_timeout)
+            except (Timeout, ConnectionError):
+                if attempt < self.DOWNLOAD_MAX_ATTEMPTS:
+                    sleep_seconds = min(self.DOWNLOAD_SLEEP_SECONDS ** attempt, 60)
+                    time.sleep(sleep_seconds)
+                    continue
+                raise
+
             if response.status_code == 200:
                 return response.content
 
