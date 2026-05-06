@@ -13,12 +13,12 @@ import time
 import zipfile
 import pytz
 from typing import Iterator, List
+from requests.exceptions import ConnectionError, Timeout
 
 import singer
 from singer import Transformer, metrics, metadata, UNIX_MILLISECONDS_INTEGER_DATETIME_PARSING
 from singer.transform import transform, unix_milliseconds_to_datetime
 from dateutil.parser import parse
-from requests.exceptions import ConnectionError, Timeout
 
 from tap_intercom.client import (
     API_VERSION,
@@ -970,11 +970,11 @@ class Contacts(IncrementalStream):
             yield from records
 
 
-class DataExport(BaseStream):
+class DataExportOverview(BaseStream):
     """
-    Export outbound content engagement data via Intercom's async export API.
+    Export outbound content engagement data and fan out to child streams.
     """
-    tap_stream_id = 'data_export'
+    tap_stream_id = 'data_export_overview'
     replication_method = 'INCREMENTAL'
     replication_key = 'created_at'
     valid_replication_keys = ['created_at']
@@ -986,7 +986,40 @@ class DataExport(BaseStream):
     DOWNLOAD_MAX_ATTEMPTS = 5
     DOWNLOAD_SLEEP_SECONDS = 2
     STREAM_PREFIX = "data_export_"
-    DEFAULT_REPLICATION_KEY = "created_at"
+    child_prefixes = [
+        "open",
+        "receipt",
+        "reply",
+        "hard_bounce",
+        "completion",
+        "goal_success",
+        "tour_step_failure",
+        "tour_step_view",
+        "reaction",
+        "click",
+        "dismissal",
+        "collected_email",
+        "unsubscribe",
+        "spam_complaint",
+        "permission_grant",
+        "button_tap",
+        "screen_view",
+        "webhook_failure",
+        "sms_failure",
+        "whatsapp_failure",
+        "push_failure",
+        "answer",
+        "keyword_reply",
+        "people_reached_receipt",
+        "checklist_step_receipt",
+        "checklist_step_open",
+        "checklist_step_click",
+        "checklist_step_completion",
+        "fin_helpful_answer",
+        "fin_step_reached",
+        "email_failure"
+    ]
+    child = []
 
     def sync(self,
              state: dict,
@@ -995,17 +1028,26 @@ class DataExport(BaseStream):
              config: dict,
              transformer: Transformer) -> dict:
         """
-        Run async export jobs in <=90 day windows and emit dynamic streams per CSV prefix.
+        Run async export jobs in <=90 day windows and emit parent/child streams.
         """
-        start_dt = self._get_created_after_from_state(state, config['start_date'])
+        bookmark_value = singer.get_bookmark(state, self.tap_stream_id, self.replication_key, config['start_date'])
+        start_dt = singer.utils.strptime_to_utc(bookmark_value)
         end_dt = singer.utils.strptime_to_utc(config.get('end_date')) if config.get('end_date') else singer.utils.now()
+        selected_streams = set(self.selected_streams)
+        is_parent_selected = self.tap_stream_id in selected_streams
+        selected_children = {
+            stream_name for stream_name in selected_streams
+            if stream_name.startswith(self.STREAM_PREFIX) and stream_name != self.tap_stream_id
+        }
 
         if start_dt >= end_dt:
-            LOGGER.info("Skipping data_export: start is not lower than end.")
+            LOGGER.info("Skipping {}: start is not lower than end.".format(self.tap_stream_id))
             return state
 
         max_parent_bookmark = start_dt
-        stream_schema_cache = {}
+        static_child_schema_written = set()
+        dynamic_schema_cache = {}
+        known_children = set(self.child)
 
         window_start = start_dt
         while window_start < end_dt:
@@ -1019,73 +1061,75 @@ class DataExport(BaseStream):
                 continue
 
             payload = self._download_export_payload(export_job)
+            rows_by_stream = self._group_rows_by_stream(payload)
+
+            for stream_id, rows in rows_by_stream.items():
+                if not rows:
+                    continue
+
+                if stream_id == self.tap_stream_id:
+                    if is_parent_selected:
+                        for row in rows:
+                            singer.write_record(self.tap_stream_id, row, time_extracted=singer.utils.now())
+                    continue
+
+                if stream_id in known_children:
+                    if stream_id not in selected_children:
+                        continue
+                    if stream_id not in static_child_schema_written:
+                        child_stream = self.catalog.get_stream(stream_id)
+                        child_stream_obj = STREAMS[stream_id](self.client, self.catalog, self.selected_streams)
+                        singer.write_schema(
+                            stream_id,
+                            child_stream.schema.to_dict(),
+                            child_stream_obj.key_properties,
+                            child_stream.replication_key
+                        )
+                        static_child_schema_written.add(stream_id)
+
+                    for row in rows:
+                        singer.write_record(stream_id, row, time_extracted=singer.utils.now())
+                    continue
+
+                # Unknown files - what do we do with them?
+                dynamic_schema = dynamic_schema_cache.get(stream_id)
+                if dynamic_schema is None:
+                    dynamic_schema = self._build_dynamic_schema(rows[0])
+                    dynamic_schema_cache[stream_id] = dynamic_schema
+                    singer.write_schema(stream_id, dynamic_schema, [], self.replication_key)
+
+                for row in rows:
+                    singer.write_record(stream_id, row, time_extracted=singer.utils.now())
+
             max_parent_bookmark = max(max_parent_bookmark, window_end)
-
-            for source_file, row in self._iter_export_rows(payload):
-                prefix = self._derive_prefix(source_file)
-                stream_id = "{}{}".format(self.STREAM_PREFIX, prefix)
-                replication_key = self.DEFAULT_REPLICATION_KEY
-
-                stream_schema_obj = stream_schema_cache.get(stream_id)
-                if stream_schema_obj is None:
-                    candidate_schema = self._build_dynamic_schema(row)
-                    stream_schema_cache[stream_id] = candidate_schema
-                    singer.write_schema(stream_id, candidate_schema, [], replication_key)
-
-                singer.write_record(stream_id, row, time_extracted=singer.utils.now())
-
             window_start = window_end
 
-        state = singer.write_bookmark(
+        return singer.write_bookmark(
             state,
             self.tap_stream_id,
             self.replication_key,
             singer.utils.strftime(max_parent_bookmark)
         )
 
-        return state
-
-    def _get_created_after_from_state(self, state, configured_start_date):
-        configured_start = singer.utils.strptime_to_utc(configured_start_date)
-        data_export_bookmark = state.get("bookmarks", {}).get(self.tap_stream_id, {})
-        if isinstance(data_export_bookmark, dict):
-            bookmark_value = data_export_bookmark.get(self.replication_key)
-        else:
-            bookmark_value = data_export_bookmark
-
-        bookmark_dt = self._parse_bookmark_value(bookmark_value)
-        return bookmark_dt if bookmark_dt else configured_start
-
-    @staticmethod
-    def _parse_bookmark_value(value):
-        try:
-            return singer.utils.strptime_to_utc(value)
-        except Exception:
-            return None
-
     def _create_export_job(self, created_after_dt, created_before_dt):
-        created_after = int(created_after_dt.timestamp())
-        created_before = int(created_before_dt.timestamp())
         payload = {
-            "created_at_after": created_after,
-            "created_at_before": created_before
+            "created_at_after": int(created_after_dt.timestamp()),
+            "created_at_before": int(created_before_dt.timestamp())
         }
 
         try:
             response = self.client.post(self.path, json=payload)
         except IntercomBadRequestError as exc:
-            error_message = str(exc)
-            if "export period is longer than 90 days" in error_message:
+            if "export period is longer than 90 days" in str(exc):
                 raise IntercomError(
-                    "Invalid Data Export window: created_at_after={} created_at_before={} exceeds 90 days.".format(
-                        created_after, created_before
+                    "Invalid payload for Data Export: created_at_after={} created_at_before={} exceeds 90 days.".format(
+                        payload["created_at_after"], payload["created_at_before"]
                     )
                 ) from None
             raise
 
         if not response.get("job_identifier"):
             raise IntercomError("Data export create job response missing job_identifier.")
-
         return response
 
     def _poll_export_job(self, job_identifier):
@@ -1110,13 +1154,8 @@ class DataExport(BaseStream):
 
     def _download_export_payload(self, export_job):
         job_identifier = export_job.get("job_identifier")
-        download_url = export_job.get("download_url")
-        if not download_url:
-            download_url = "{}/download/content/data/{}".format(self.client.base_url, job_identifier)
-
-        if not download_url.startswith("http"):
-            download_url = "{}/{}".format(self.client.base_url.rstrip("/"), download_url.lstrip("/"))
-
+        download_url = export_job.get("download_url") or "{}/download/content/data/{}".format(self.client.base_url, job_identifier)
+       
         session = getattr(self.client, "_IntercomClient__session")
         access_token = getattr(self.client, "_IntercomClient__access_token")
         request_timeout = getattr(self.client, "_IntercomClient__request_timeout")
@@ -1132,8 +1171,7 @@ class DataExport(BaseStream):
                 response = session.get(download_url, headers=headers, timeout=request_timeout)
             except (Timeout, ConnectionError):
                 if attempt < self.DOWNLOAD_MAX_ATTEMPTS:
-                    sleep_seconds = min(self.DOWNLOAD_SLEEP_SECONDS ** attempt, 60)
-                    time.sleep(sleep_seconds)
+                    time.sleep(min(self.DOWNLOAD_SLEEP_SECONDS ** attempt, 60))
                     continue
                 raise
 
@@ -1141,13 +1179,23 @@ class DataExport(BaseStream):
                 return response.content
 
             if attempt < self.DOWNLOAD_MAX_ATTEMPTS and (response.status_code == 429 or response.status_code >= 500):
-                sleep_seconds = min(self.DOWNLOAD_SLEEP_SECONDS ** attempt, 60)
-                time.sleep(sleep_seconds)
+                time.sleep(min(self.DOWNLOAD_SLEEP_SECONDS ** attempt, 60))
                 continue
 
             raise_for_error(response)
 
         raise IntercomError("Data export download failed after retries.")
+
+    def _group_rows_by_stream(self, payload):
+        rows_by_stream = {}
+        for source_file, row in self._iter_export_rows(payload):
+            prefix = self._derive_prefix(source_file)
+            if prefix == "overview":
+                stream_id = self.tap_stream_id
+            else:
+                stream_id = "{}{}".format(self.STREAM_PREFIX, prefix)
+            rows_by_stream.setdefault(stream_id, []).append(row)
+        return rows_by_stream
 
     def _iter_export_rows(self, payload):
         payload_buffer = io.BytesIO(payload)
@@ -1187,15 +1235,40 @@ class DataExport(BaseStream):
 
     @staticmethod
     def _build_dynamic_schema(record):
-        properties = {}
-        for key in record.keys():
-            properties[key] = {"type": ["null", "string", "integer", "number", "boolean"]}
-
         return {
             "type": "object",
             "additionalProperties": False,
-            "properties": properties
+            "properties": {
+                key: {"type": ["null", "string", "integer", "number", "boolean"]}
+                for key in record.keys()
+            }
         }
+
+
+DataExportOverview.child = [
+    "data_export_{}".format(prefix) for prefix in DataExportOverview.child_prefixes
+]
+
+
+class DataExportChildStream(BaseStream):
+    """
+    Child stream marker for data export engagement files.
+    """
+    replication_method = 'FULL_TABLE'
+    parent = DataExportOverview
+
+
+def build_data_export_child_stream(prefix):
+    stream_id = "data_export_{}".format(prefix)
+    class_name = "".join(word.capitalize() for word in stream_id.split("_"))
+    return type(class_name, (DataExportChildStream,), {"tap_stream_id": stream_id})
+
+
+DATA_EXPORT_CHILD_STREAMS = {
+    "data_export_{}".format(prefix): build_data_export_child_stream(prefix)
+    for prefix in DataExportOverview.child_prefixes
+}
+
 
 class Segments(IncrementalStream):
     """
@@ -1301,8 +1374,9 @@ STREAMS = {
     "conversation_parts": ConversationParts,
     "contact_attributes": ContactAttributes,
     "contacts": Contacts,
-    "data_export": DataExport,
+    "data_export_overview": DataExportOverview,
     "segments": Segments,
     "tags": Tags,
     "teams": Teams
 }
+STREAMS.update(DATA_EXPORT_CHILD_STREAMS)
