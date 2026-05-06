@@ -2,6 +2,6 @@
   "type": "object",
   "additionalProperties": true,
   "properties": {
-    "not_defined": { "type": ["null"] }
+    "receipt_id": {"type": ["null","string"]}
   }
 }
