@@ -1,0 +1,7 @@
+{
+  "type": "object",
+  "additionalProperties": true,
+  "properties": {
+    "not_defined": { "type": ["null"] }
+  }
+}

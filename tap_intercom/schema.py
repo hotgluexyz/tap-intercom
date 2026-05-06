@@ -23,7 +23,14 @@ def get_schemas():
     for stream_name, stream_object in STREAMS.items():
         replication_ind = stream_object.to_replicate
         if replication_ind:
-            schema_path = get_abs_path('schemas/{}.json'.format(stream_name))
+            if stream_name.startswith('data_export_'):
+                child_stream_name = stream_name.replace('data_export_', '', 1)
+                schema_path = get_abs_path('schemas/data_export/{}.json'.format(child_stream_name))
+                if not os.path.exists(schema_path):
+                    schema_path = get_abs_path('schemas/data_export/generic.json')
+            else:
+                schema_path = get_abs_path('schemas/{}.json'.format(stream_name))
+
             with open(schema_path) as file:
                 schema = json.load(file)
             schemas[stream_name] = schema

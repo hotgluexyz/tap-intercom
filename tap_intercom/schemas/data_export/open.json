@@ -1,0 +1,8 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "receipt_id": {"type": ["null","string"]},
+    "opened_at": {"type": ["null","string"], "format": "date-time"}
+  }
+}
