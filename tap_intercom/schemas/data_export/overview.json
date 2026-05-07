@@ -17,7 +17,6 @@
     "last_edited_by": { "type": ["null", "string"] },
     "last_edited_at": { "type": ["null", "string"], "format": "date-time" },
     "url": { "type": ["null", "string"] },
-
     "receipt_total": { "type": ["null", "integer"] },
     "receipt_unique": { "type": ["null", "integer"] },
     "reply_total": { "type": ["null", "integer"] },

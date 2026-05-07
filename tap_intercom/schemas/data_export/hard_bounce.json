@@ -2,7 +2,7 @@
   "type": "object",
   "additionalProperties": false,
   "properties": {
-    "receipt_id": {"type": ["null","string"]},
+    "receipt_id": {"type": ["null","integer"]},
     "hard_bounced_at": {"type": ["null","string"], "format": "date-time"}
   }
 }
