@@ -1047,6 +1047,9 @@ class DataExportOverview(BaseStream):
         max_parent_bookmark = start_dt
         static_child_schema_written = set()
         dynamic_schema_cache = {}
+        datetime_path_cache = {
+            self.tap_stream_id: find_datetimes_in_schema(stream_schema)
+        }
         known_children = set(self.child)
 
         window_start = start_dt
@@ -1069,7 +1072,9 @@ class DataExportOverview(BaseStream):
 
                 if stream_id == self.tap_stream_id:
                     if is_parent_selected:
+                        datetime_paths = datetime_path_cache.get(stream_id, [])
                         for row in rows:
+                            self._normalize_blank_datetime_values(row, datetime_paths)
                             singer.write_record(self.tap_stream_id, row, time_extracted=singer.utils.now())
                     continue
 
@@ -1079,15 +1084,19 @@ class DataExportOverview(BaseStream):
                     if stream_id not in static_child_schema_written:
                         child_stream = self.catalog.get_stream(stream_id)
                         child_stream_obj = STREAMS[stream_id](self.client, self.catalog, self.selected_streams)
+                        child_schema = child_stream.schema.to_dict()
                         singer.write_schema(
                             stream_id,
-                            child_stream.schema.to_dict(),
+                            child_schema,
                             child_stream_obj.key_properties,
                             child_stream.replication_key
                         )
+                        datetime_path_cache[stream_id] = find_datetimes_in_schema(child_schema)
                         static_child_schema_written.add(stream_id)
 
+                    datetime_paths = datetime_path_cache.get(stream_id, [])
                     for row in rows:
+                        self._normalize_blank_datetime_values(row, datetime_paths)
                         singer.write_record(stream_id, row, time_extracted=singer.utils.now())
                     continue
 
@@ -1243,6 +1252,15 @@ class DataExportOverview(BaseStream):
                 for key in record.keys()
             }
         }
+
+    @staticmethod
+    def _normalize_blank_datetime_values(record, datetime_paths):
+        for path in datetime_paths:
+            if len(path) != 1:
+                continue
+            key = path[0]
+            if record.get(key) == "":
+                record[key] = None
 
 
 DataExportOverview.child = [
