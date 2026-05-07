@@ -1164,8 +1164,6 @@ class DataExportOverview(BaseStream):
         return response
 
     def _poll_export_job(self, job_identifier):
-        if not job_identifier:
-            raise IntercomError("Cannot poll data export status without job_identifier.")
 
         status_path = "{}/{}".format(self.path, job_identifier)
         for _ in range(self.POLL_MAX_ATTEMPTS):
