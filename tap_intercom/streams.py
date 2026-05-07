@@ -1046,11 +1046,12 @@ class DataExportOverview(BaseStream):
 
         max_parent_bookmark = start_dt
         static_child_schema_written = set()
-        dynamic_schema_cache = {}
         datetime_path_cache = {
             self.tap_stream_id: find_datetimes_in_schema(stream_schema)
         }
         known_children = set(self.child)
+        unknown_children = set()
+
 
         window_start = start_dt
         while window_start < end_dt:
@@ -1078,18 +1079,21 @@ class DataExportOverview(BaseStream):
                             singer.write_record(self.tap_stream_id, row, time_extracted=singer.utils.now())
                     continue
 
-                if stream_id in known_children:
-                    if stream_id not in selected_children:
-                        continue
+                if stream_id in selected_children:
+                    
                     if stream_id not in static_child_schema_written:
                         child_stream = self.catalog.get_stream(stream_id)
                         child_stream_obj = STREAMS[stream_id](self.client, self.catalog, self.selected_streams)
                         child_schema = child_stream.schema.to_dict()
+
+                        if self._is_generic_data_export_schema(child_schema):
+                            child_schema = self._build_dynamic_schema(rows[0])
+                            
                         singer.write_schema(
                             stream_id,
                             child_schema,
-                            child_stream_obj.key_properties,
-                            child_stream.replication_key
+                            child_stream_obj.key_properties, #[] by now
+                            child_stream.replication_key #None by now
                         )
                         datetime_path_cache[stream_id] = find_datetimes_in_schema(child_schema)
                         static_child_schema_written.add(stream_id)
@@ -1099,16 +1103,15 @@ class DataExportOverview(BaseStream):
                         self._normalize_blank_datetime_values(row, datetime_paths)
                         singer.write_record(stream_id, row, time_extracted=singer.utils.now())
                     continue
-
-                # Unknown files - what do we do with them?
-                dynamic_schema = dynamic_schema_cache.get(stream_id)
-                if dynamic_schema is None:
-                    dynamic_schema = self._build_dynamic_schema(rows[0])
-                    dynamic_schema_cache[stream_id] = dynamic_schema
-                    singer.write_schema(stream_id, dynamic_schema, [], self.replication_key)
-
-                for row in rows:
-                    singer.write_record(stream_id, row, time_extracted=singer.utils.now())
+                
+                if stream_id not in known_children \
+                    and stream_id not in unknown_children:
+                    unknown_children.add(stream_id) 
+                    LOGGER.warning(
+                        'Skipping unknown data export child stream "{}" with columns: {}'.format(
+                            stream_id, sorted(rows[0].keys())
+                        )
+                    )                      
 
             max_parent_bookmark = max(max_parent_bookmark, window_end)
             window_start = window_end
@@ -1248,10 +1251,22 @@ class DataExportOverview(BaseStream):
             "type": "object",
             "additionalProperties": False,
             "properties": {
-                key: {"type": ["null", "string", "integer", "number", "boolean"]}
+                key: {"type": ["null", "string"]}
                 for key in record.keys()
             }
         }
+
+    @staticmethod
+    def _is_generic_data_export_schema(schema):
+        if not isinstance(schema, dict):
+            return False
+        properties = schema.get("properties", {})
+        if not isinstance(properties, dict):
+            return False
+
+        # Placeholder schema marker used for generic data export child streams.
+        marker_keys = {"all_properties_from_generic_stream"}
+        return schema.get("additionalProperties") is True and any(key in properties for key in marker_keys)
 
     @staticmethod
     def _normalize_blank_datetime_values(record, datetime_paths):

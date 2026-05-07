@@ -2,6 +2,6 @@
   "type": "object",
   "additionalProperties": true,
   "properties": {
-    "receipt_id": {"type": ["null","string"]}
+    "all_properties_from_generic_stream": {"type": ["null","string"]}
   }
 }
