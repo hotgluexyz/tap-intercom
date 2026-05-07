@@ -5,10 +5,8 @@ This module defines the stream classes and their individual sync logic.
 
 import datetime
 import csv
-import gzip
 import hashlib
 import io
-import re
 import time
 import zipfile
 import pytz
@@ -1240,10 +1238,6 @@ class DataExportOverview(BaseStream):
                             yield filename, row
             return
 
-        payload_buffer.seek(0)
-        with gzip.GzipFile(fileobj=payload_buffer, mode="rb") as gz_file:
-            for row in self._read_csv_rows(gz_file):
-                yield "data_export.csv", row
 
     @staticmethod
     def _read_csv_rows(binary_file):
