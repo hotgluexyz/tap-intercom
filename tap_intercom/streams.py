@@ -1254,13 +1254,10 @@ class DataExportOverview(BaseStream):
 
     @staticmethod
     def _derive_prefix(source_file):
-        filename = source_file.split("/")[-1]
-        name_without_ext = filename.rsplit(".", 1)[0]
+        name_without_ext = source_file.rsplit(".", 1)[0]
         parts = name_without_ext.split("_")
-        raw_prefix = "_".join(parts[:-1]) if len(parts) > 1 else name_without_ext
-        normalized = re.sub(r"[^a-z0-9_]+", "_", raw_prefix.lower())
-        normalized = re.sub(r"_+", "_", normalized).strip("_")
-        return normalized or "unknown"
+        prefix = "_".join(parts[:-1])
+        return prefix or "unknown"
 
     @staticmethod
     def _build_dynamic_schema(record):
