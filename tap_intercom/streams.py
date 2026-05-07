@@ -1049,6 +1049,8 @@ class DataExportOverview(BaseStream):
         datetime_path_cache = {
             self.tap_stream_id: find_datetimes_in_schema(stream_schema)
         }
+        child_schema_cache = {}
+        child_metadata_cache = {}
         known_children = set(self.child)
         unknown_children = set()
 
@@ -1075,8 +1077,14 @@ class DataExportOverview(BaseStream):
                     if is_parent_selected:
                         datetime_paths = datetime_path_cache.get(stream_id, [])
                         for row in rows:
-                            self._normalize_blank_datetime_values(row, datetime_paths)
-                            singer.write_record(self.tap_stream_id, row, time_extracted=singer.utils.now())
+                            transform_times(row, datetime_paths)
+                            transformed_record = transform(
+                                row,
+                                stream_schema,
+                                integer_datetime_fmt=UNIX_MILLISECONDS_INTEGER_DATETIME_PARSING,
+                                metadata=stream_metadata
+                            )
+                            singer.write_record(self.tap_stream_id, transformed_record, time_extracted=singer.utils.now())
                     continue
 
                 if stream_id in selected_children:
@@ -1085,6 +1093,7 @@ class DataExportOverview(BaseStream):
                         child_stream = self.catalog.get_stream(stream_id)
                         child_stream_obj = STREAMS[stream_id](self.client, self.catalog, self.selected_streams)
                         child_schema = child_stream.schema.to_dict()
+                        child_metadata = metadata.to_map(child_stream.metadata)
 
                         if self._is_generic_data_export_schema(child_schema):
                             child_schema = self._build_dynamic_schema(rows[0])
@@ -1096,12 +1105,22 @@ class DataExportOverview(BaseStream):
                             child_stream.replication_key #None by now
                         )
                         datetime_path_cache[stream_id] = find_datetimes_in_schema(child_schema)
+                        child_schema_cache[stream_id] = child_schema
+                        child_metadata_cache[stream_id] = child_metadata
                         static_child_schema_written.add(stream_id)
 
                     datetime_paths = datetime_path_cache.get(stream_id, [])
+                    child_schema = child_schema_cache.get(stream_id, {})
+                    child_metadata = child_metadata_cache.get(stream_id, {})
                     for row in rows:
-                        self._normalize_blank_datetime_values(row, datetime_paths)
-                        singer.write_record(stream_id, row, time_extracted=singer.utils.now())
+                        transform_times(row, datetime_paths)
+                        transformed_record = transform(
+                            row,
+                            child_schema,
+                            integer_datetime_fmt=UNIX_MILLISECONDS_INTEGER_DATETIME_PARSING,
+                            metadata=child_metadata
+                        )
+                        singer.write_record(stream_id, transformed_record, time_extracted=singer.utils.now())
                     continue
                 
                 if stream_id not in known_children \
@@ -1267,16 +1286,6 @@ class DataExportOverview(BaseStream):
         # Placeholder schema marker used for generic data export child streams.
         marker_keys = {"all_properties_from_generic_stream"}
         return schema.get("additionalProperties") is True and any(key in properties for key in marker_keys)
-
-    @staticmethod
-    def _normalize_blank_datetime_values(record, datetime_paths):
-        for path in datetime_paths:
-            if len(path) != 1:
-                continue
-            key = path[0]
-            if record.get(key) == "":
-                record[key] = None
-
 
 DataExportOverview.child = [
     "data_export_{}".format(prefix) for prefix in DataExportOverview.child_prefixes
