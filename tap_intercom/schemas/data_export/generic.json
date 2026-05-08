@@ -1,0 +1,7 @@
+{
+  "type": "object",
+  "additionalProperties": true,
+  "properties": {
+    "all_properties_from_generic_stream": {"type": ["null","string"]}
+  }
+}

@@ -57,7 +57,10 @@ def get_streams_to_sync(catalog, selected_streams, selected_stream_names):
             # The purpose of admin_list is to return a list of admins through which individual admins will be synced.
             if stream_obj == Admins:
                 streams_to_sync.append(catalog.get_stream(stream_obj.tap_stream_id))
-            elif stream_obj.parent.tap_stream_id not in selected_stream_names:
+            elif (
+                stream_obj.parent.tap_stream_id not in selected_stream_names
+                and not any(s.tap_stream_id == stream_obj.parent.tap_stream_id for s in streams_to_sync)
+            ):
                 streams_to_sync.append(catalog.get_stream(stream_obj.parent.tap_stream_id))
 
     return streams_to_sync

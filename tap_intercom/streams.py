@@ -4,17 +4,27 @@ This module defines the stream classes and their individual sync logic.
 
 
 import datetime
+import csv
 import hashlib
+import io
 import time
+import zipfile
 import pytz
 from typing import Iterator, List
+from requests.exceptions import ConnectionError, Timeout
 
 import singer
 from singer import Transformer, metrics, metadata, UNIX_MILLISECONDS_INTEGER_DATETIME_PARSING
 from singer.transform import transform, unix_milliseconds_to_datetime
 from dateutil.parser import parse
 
-from tap_intercom.client import (IntercomClient, IntercomError)
+from tap_intercom.client import (
+    API_VERSION,
+    IntercomBadRequestError,
+    IntercomClient,
+    IntercomError,
+    raise_for_error,
+)
 from tap_intercom.transform import (transform_json, transform_times, find_datetimes_in_schema)
 
 import concurrent.futures
@@ -500,7 +510,7 @@ class CompanyAttributes(FullTableStream):
             yield from response.get(self.data_key,  [])
 
 
-class CompnaySegments(IncrementalStream):
+class CompanySegments(IncrementalStream):
     """
     Retrieve company segments
 
@@ -958,6 +968,339 @@ class Contacts(IncrementalStream):
             yield from records
 
 
+class DataExportOverview(BaseStream):
+    """
+    Export outbound content engagement data and fan out to child streams.
+    """
+    tap_stream_id = 'data_export_overview'
+    replication_method = 'INCREMENTAL'
+    replication_key = 'created_at'
+    valid_replication_keys = ['created_at']
+    path = 'export/content/data'
+
+    MAX_WINDOW_DAYS = 90
+    POLL_MAX_ATTEMPTS = 60
+    POLL_SLEEP_SECONDS = 1
+    DOWNLOAD_MAX_ATTEMPTS = 5
+    DOWNLOAD_SLEEP_SECONDS = 2
+    STREAM_PREFIX = "data_export_"
+    child_prefixes = [
+        "open",
+        "receipt",
+        "reply",
+        "hard_bounce",
+        "completion",
+        "goal_success",
+        "tour_step_failure",
+        "tour_step_view",
+        "reaction",
+        "click",
+        "dismissal",
+        "collected_email",
+        "unsubscribe",
+        "spam_complaint",
+        "permission_grant",
+        "button_tap",
+        "screen_view",
+        "webhook_failure",
+        "sms_failure",
+        "whatsapp_failure",
+        "push_failure",
+        "answer",
+        "keyword_reply",
+        "people_reached_receipt",
+        "checklist_step_receipt",
+        "checklist_step_open",
+        "checklist_step_click",
+        "checklist_step_completion",
+        "fin_helpful_answer",
+        "fin_step_reached",
+        "email_failure"
+    ]
+    child = []
+
+    def sync(self,
+             state: dict,
+             stream_schema: dict,
+             stream_metadata: dict,
+             config: dict,
+             transformer: Transformer) -> dict:
+        """
+        Run async export jobs in <=90 day windows and emit parent/child streams.
+        """
+        bookmark_value = singer.get_bookmark(state, self.tap_stream_id, self.replication_key, config['start_date'])
+        start_dt = singer.utils.strptime_to_utc(bookmark_value)
+        end_dt = singer.utils.strptime_to_utc(config.get('end_date')) if config.get('end_date') else singer.utils.now()
+        selected_streams = set(self.selected_streams)
+        is_parent_selected = self.tap_stream_id in selected_streams
+        selected_children = {
+            stream_name for stream_name in selected_streams
+            if stream_name.startswith(self.STREAM_PREFIX) and stream_name != self.tap_stream_id
+        }
+
+        if start_dt >= end_dt:
+            LOGGER.info("Skipping {}: start is not lower than end.".format(self.tap_stream_id))
+            return state
+
+        max_parent_bookmark = start_dt
+        static_child_schema_written = set()
+        datetime_path_cache = {
+            self.tap_stream_id: find_datetimes_in_schema(stream_schema)
+        }
+        child_schema_cache = {}
+        child_metadata_cache = {}
+        known_children = set(self.child)
+        unknown_children = set()
+
+
+        window_start = start_dt
+        while window_start < end_dt:
+            window_end = min(window_start + datetime.timedelta(days=self.MAX_WINDOW_DAYS), end_dt)
+            export_job = self._create_export_job(window_start, window_end)
+            export_job = self._poll_export_job(export_job.get("job_identifier"))
+
+            if export_job.get("status") == "no_data":
+                max_parent_bookmark = max(max_parent_bookmark, window_end)
+                window_start = window_end
+                continue
+
+            payload = self._download_export_payload(export_job)
+            rows_by_stream = self._group_rows_by_stream(payload)
+
+            for stream_id, rows in rows_by_stream.items():
+                if not rows:
+                    continue
+
+                if stream_id == self.tap_stream_id:
+                    if is_parent_selected:
+                        datetime_paths = datetime_path_cache.get(stream_id, [])
+                        for row in rows:
+                            transform_times(row, datetime_paths)
+                            transformed_record = transform(
+                                row,
+                                stream_schema,
+                                integer_datetime_fmt=UNIX_MILLISECONDS_INTEGER_DATETIME_PARSING,
+                                metadata=stream_metadata
+                            )
+                            singer.write_record(self.tap_stream_id, transformed_record, time_extracted=singer.utils.now())
+                    continue
+
+                if stream_id in selected_children:
+                    
+                    if stream_id not in static_child_schema_written:
+                        child_stream = self.catalog.get_stream(stream_id)
+                        child_stream_obj = STREAMS[stream_id](self.client, self.catalog, self.selected_streams)
+                        child_schema = child_stream.schema.to_dict()
+                        child_metadata = metadata.to_map(child_stream.metadata)
+
+                        if self._is_generic_data_export_schema(child_schema):
+                            child_schema = self._build_dynamic_schema(rows[0])
+                            
+                        singer.write_schema(
+                            stream_id,
+                            child_schema,
+                            child_stream_obj.key_properties, #[] by now
+                            child_stream.replication_key #None by now
+                        )
+                        datetime_path_cache[stream_id] = find_datetimes_in_schema(child_schema)
+                        child_schema_cache[stream_id] = child_schema
+                        child_metadata_cache[stream_id] = child_metadata
+                        static_child_schema_written.add(stream_id)
+
+                    datetime_paths = datetime_path_cache.get(stream_id, [])
+                    child_schema = child_schema_cache.get(stream_id, {})
+                    child_metadata = child_metadata_cache.get(stream_id, {})
+                    for row in rows:
+                        transform_times(row, datetime_paths)
+                        transformed_record = transform(
+                            row,
+                            child_schema,
+                            integer_datetime_fmt=UNIX_MILLISECONDS_INTEGER_DATETIME_PARSING,
+                            metadata=child_metadata
+                        )
+                        singer.write_record(stream_id, transformed_record, time_extracted=singer.utils.now())
+                    continue
+                
+                if stream_id not in known_children \
+                    and stream_id not in unknown_children:
+                    unknown_children.add(stream_id) 
+                    LOGGER.warning(
+                        'Skipping unknown data export child stream "{}" with columns: {}'.format(
+                            stream_id, sorted(rows[0].keys())
+                        )
+                    )                      
+
+            max_parent_bookmark = max(max_parent_bookmark, window_end)
+            window_start = window_end
+
+        return singer.write_bookmark(
+            state,
+            self.tap_stream_id,
+            self.replication_key,
+            singer.utils.strftime(max_parent_bookmark)
+        )
+
+    def _create_export_job(self, created_after_dt, created_before_dt):
+        payload = {
+            "created_at_after": int(created_after_dt.timestamp()),
+            "created_at_before": int(created_before_dt.timestamp())
+        }
+
+        try:
+            response = self.client.post(self.path, json=payload)
+        except IntercomBadRequestError as exc:
+            if "export period is longer than 90 days" in str(exc):
+                raise IntercomError(
+                    "Invalid payload for Data Export: created_at_after={} created_at_before={} exceeds 90 days.".format(
+                        payload["created_at_after"], payload["created_at_before"]
+                    )
+                ) from None
+            raise
+
+        if not response.get("job_identifier"):
+            raise IntercomError("Data export create job response missing job_identifier.")
+        return response
+
+    def _poll_export_job(self, job_identifier):
+
+        status_path = "{}/{}".format(self.path, job_identifier)
+        for _ in range(self.POLL_MAX_ATTEMPTS):
+            response = self.client.get(status_path)
+            status = response.get("status")
+
+            if status in {"completed", "no_data"}:
+                return response
+            if status in {"failed", "canceled"}:
+                raise IntercomError("Data export job {} finished with status '{}'.".format(job_identifier, status))
+            if status not in {"pending", "in_progress"}:
+                raise IntercomError("Data export job {} returned unknown status '{}'.".format(job_identifier, status))
+
+            time.sleep(self.POLL_SLEEP_SECONDS)
+
+        raise IntercomError("Data export job {} polling timed out.".format(job_identifier))
+
+    def _download_export_payload(self, export_job):
+        job_identifier = export_job.get("job_identifier")
+        download_url = export_job.get("download_url") or "{}/download/content/data/{}".format(self.client.base_url, job_identifier)
+       
+        session = getattr(self.client, "_IntercomClient__session")
+        access_token = getattr(self.client, "_IntercomClient__access_token")
+        request_timeout = getattr(self.client, "_IntercomClient__request_timeout")
+
+        headers = {
+            "Authorization": "Bearer {}".format(access_token),
+            "Accept": "application/octet-stream",
+            "Intercom-Version": API_VERSION
+        }
+
+        for attempt in range(1, self.DOWNLOAD_MAX_ATTEMPTS + 1):
+            try:
+                response = session.get(download_url, headers=headers, timeout=request_timeout)
+            except (Timeout, ConnectionError):
+                if attempt < self.DOWNLOAD_MAX_ATTEMPTS:
+                    time.sleep(min(self.DOWNLOAD_SLEEP_SECONDS ** attempt, 60))
+                    continue
+                raise
+
+            if response.status_code == 200:
+                return response.content
+
+            if attempt < self.DOWNLOAD_MAX_ATTEMPTS and (response.status_code == 429 or response.status_code >= 500):
+                time.sleep(min(self.DOWNLOAD_SLEEP_SECONDS ** attempt, 60))
+                continue
+
+            raise_for_error(response)
+
+        raise IntercomError("Data export download failed after retries.")
+
+    def _group_rows_by_stream(self, payload):
+        rows_by_stream = {}
+        for source_file, row in self._iter_export_rows(payload):
+            prefix = self._derive_prefix(source_file)
+            if prefix == "overview":
+                stream_id = self.tap_stream_id
+            else:
+                stream_id = "{}{}".format(self.STREAM_PREFIX, prefix)
+            rows_by_stream.setdefault(stream_id, []).append(row)
+        return rows_by_stream
+
+    def _iter_export_rows(self, payload):
+        payload_buffer = io.BytesIO(payload)
+
+        if zipfile.is_zipfile(payload_buffer):
+            payload_buffer.seek(0)
+            with zipfile.ZipFile(payload_buffer) as zip_archive:
+                for filename in sorted(zip_archive.namelist()):
+                    if not filename.lower().endswith(".csv"):
+                        continue
+                    with zip_archive.open(filename) as file_obj:
+                        for row in self._read_csv_rows(file_obj):
+                            yield filename, row
+            return
+
+
+    @staticmethod
+    def _read_csv_rows(binary_file):
+        text_stream = io.TextIOWrapper(binary_file, encoding="utf-8")
+        csv_reader = csv.DictReader(text_stream)
+        for row in csv_reader:
+            yield row
+
+    @staticmethod
+    def _derive_prefix(source_file):
+        name_without_ext = source_file.rsplit(".", 1)[0]
+        parts = name_without_ext.split("_")
+        prefix = "_".join(parts[:-1])
+        return prefix or "unknown"
+
+    @staticmethod
+    def _build_dynamic_schema(record):
+        return {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                key: {"type": ["null", "string"]}
+                for key in record.keys()
+            }
+        }
+
+    @staticmethod
+    def _is_generic_data_export_schema(schema):
+        if not isinstance(schema, dict):
+            return False
+        properties = schema.get("properties", {})
+        if not isinstance(properties, dict):
+            return False
+
+        # Placeholder schema marker used for generic data export child streams.
+        marker_keys = {"all_properties_from_generic_stream"}
+        return schema.get("additionalProperties") is True and any(key in properties for key in marker_keys)
+
+DataExportOverview.child = [
+    "data_export_{}".format(prefix) for prefix in DataExportOverview.child_prefixes
+]
+
+
+class DataExportChildStream(BaseStream):
+    """
+    Child stream marker for data export engagement files.
+    """
+    replication_method = 'FULL_TABLE'
+    parent = DataExportOverview
+
+
+def build_data_export_child_stream(prefix):
+    stream_id = "data_export_{}".format(prefix)
+    class_name = "".join(word.capitalize() for word in stream_id.split("_"))
+    return type(class_name, (DataExportChildStream,), {"tap_stream_id": stream_id})
+
+
+DATA_EXPORT_CHILD_STREAMS = {
+    "data_export_{}".format(prefix): build_data_export_child_stream(prefix)
+    for prefix in DataExportOverview.child_prefixes
+}
+
+
 class Segments(IncrementalStream):
     """
     Retrieve segments
@@ -1056,13 +1399,15 @@ STREAMS = {
     "admins": Admins,
     "companies": Companies,
     "company_attributes": CompanyAttributes,
-    "company_segments": CompnaySegments,
+    "company_segments": CompanySegments,
     "conversations": Conversations,
     "conversation_details": ConversationDetails,
     "conversation_parts": ConversationParts,
     "contact_attributes": ContactAttributes,
     "contacts": Contacts,
+    "data_export_overview": DataExportOverview,
     "segments": Segments,
     "tags": Tags,
     "teams": Teams
 }
+STREAMS.update(DATA_EXPORT_CHILD_STREAMS)
