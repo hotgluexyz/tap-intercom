@@ -1,6 +1,8 @@
+import json
 import nose
 import unittest
-from singer.transform import unix_milliseconds_to_datetime
+from pathlib import Path
+from singer.transform import transform, unix_milliseconds_to_datetime
 from tap_intercom.transform import get_integer_places, transform_json, find_datetimes_in_schema
 from parameterized import parameterized
 
@@ -32,6 +34,23 @@ def test_unix_milliseconds_to_datetime():
     }
     for input_values, expected_values in input_output_mapping.items():
         assert expected_values == unix_milliseconds_to_datetime(input_values)
+
+
+def test_conversation_part_event_details_are_preserved():
+    schema_path = (
+        Path(__file__).parents[2]
+        / 'tap_intercom'
+        / 'schemas'
+        / 'conversation_parts.json'
+    )
+    schema = json.loads(schema_path.read_text())
+    event_details = {
+        'attribute': {'name': 'Language'},
+        'value': {'name': 'English'},
+    }
+
+    assert transform({'event_details': event_details}, schema)['event_details'] == event_details
+
 
 class TestTransform(unittest.TestCase):
 

@@ -6,7 +6,7 @@ import singer
 
 LOGGER = singer.get_logger()
 
-API_VERSION = '2.5'
+API_VERSION = '2.13'
 
 REQUEST_TIMEOUT = 300
 

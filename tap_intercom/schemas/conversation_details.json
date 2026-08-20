@@ -845,6 +845,13 @@
                   }
                 }
               },
+              "event_details": {
+                "type": [
+                  "null",
+                  "object"
+                ],
+                "additionalProperties": true
+              },
               "external_id": {
                 "type": [
                   "null",
