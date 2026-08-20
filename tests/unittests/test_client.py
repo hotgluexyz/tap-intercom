@@ -32,6 +32,10 @@ class TestResponse(unittest.TestCase):
         
         self.assertEqual(response, expected_data)
         self.assertEqual(mocked_true_successful.call_count, 1)
+        self.assertEqual(
+            mocked_true_successful.call_args.kwargs['headers']['Intercom-Version'],
+            '2.13'
+        )
     
     
     @mock.patch("time.sleep")

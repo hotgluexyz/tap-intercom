@@ -66,6 +66,13 @@
         }
       ]
     },
+    "event_details": {
+      "type": [
+        "null",
+        "object"
+      ],
+      "additionalProperties": true
+    },
     "author": {
       "type": [
         "null",
